@@ -6,7 +6,8 @@
     "Batching / buffering","Partitioning / hot-key","Replication / consistency","Caching",
     "Write- vs read-time","Inverted index","Scatter-gather","Tiered / columnar","Idempotency",
     "Consensus / fencing","CDN / edge","Tail latency","Real-time / routing","Saga / compensation",
-    "Geospatial","Backpressure","Storage internals","Distributed sort","CRDTs","Distributed tracing"
+    "Geospatial","Backpressure","Storage internals","Distributed sort","CRDTs","Distributed tracing",
+    "Streaming aggregation"
   ];
   var systems = [
     "Rate limiter","Kafka","Key-value store","RDBMS scaling","Object store","Datadog",
@@ -24,7 +25,7 @@
     "p1.html": 1, "p2.html": 1, "p3.html": 1, "p4.html": 1, "p5.html": 1, "p6.html": 1,
     "p7.html": 1, "p8.html": 1, "p9.html": 1, "p10.html": 1, "p11.html": 1, "p12.html": 1,
     "p13.html": 1, "p14.html": 1, "p15.html": 1, "p16.html": 1, "p17.html": 1,
-    "p18.html": 1, "p19.html": 1, "p20.html": 1,
+    "p18.html": 1, "p19.html": 1, "p20.html": 1, "p21.html": 1,
     // Systems — all at full interview-answer depth
     "s1.html": 1, "s2.html": 1, "s3.html": 1, "s4.html": 1, "s5.html": 1, "s6.html": 1,
     "s7.html": 1, "s8.html": 1, "s9.html": 1, "s10.html": 1, "s11.html": 1, "s12.html": 1,
@@ -69,19 +70,7 @@
   function insertAfter(node, ref) { ref.parentNode.insertBefore(node, ref.nextSibling); }
 
   function runStatus() {
-    // 1) per-page banner on primitive/system pages (just under the <h1>)
-    if (/^[ps]\d+\.html$/.test(here)) {
-      var done = isDone(here);
-      var bar = document.createElement("div");
-      bar.className = "pagestatus " + (done ? "is-done" : "is-wip");
-      bar.innerHTML = done
-        ? "Complete <small>Reviewed to full depth.</small>"
-        : "Work in progress <small>Draft — not yet reviewed to full depth; details may be thin or change.</small>";
-      var h1 = document.querySelector(".reading h1") || document.querySelector("h1");
-      if (h1) insertAfter(bar, h1);
-    }
-
-    // 2) badges on landing-page tiles
+    // 1) badges on landing-page tiles
     var tiles = document.querySelectorAll("a.tile");
     for (var i = 0; i < tiles.length; i++) {
       var f = fileOf(tiles[i].getAttribute("href"));
@@ -93,14 +82,14 @@
       tiles[i].appendChild(s);
     }
 
-    // 3) legend on the landing page (just under the <h1>)
+    // 2) legend on the landing page (just under the <h1>)
     if (here === "index.html" || here === "") {
       var lg = document.createElement("div");
       lg.className = "statuslegend";
       lg.innerHTML =
         'Reading guide: <span class="st st-done">Complete</span> pages are reviewed to full depth. ' +
         '<span class="st st-wip">Draft</span> pages are still work in progress. ' +
-        "All 20 primitives and all 22 systems are now complete to full depth.";
+        "All 21 primitives and all 22 systems are now complete to full depth.";
       var ih1 = document.querySelector(".reading h1") || document.querySelector("h1");
       if (ih1) insertAfter(lg, ih1);
     }

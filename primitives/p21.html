@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P21 Streaming aggregation &amp; windowing — System Design Curriculum</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head><body>
+<div class="wrap">
+<nav class="side" id="side"></nav>
+<main><div class="reading" id="top">
+<div class="crumb"><a href="../index.html">Curriculum</a> / Part II · Primitives / P21</div><h1>P21 · Streaming aggregation &amp; windowing</h1>
+<div class="summary"><div class="field"><b>What it is:</b> continuously turning an <b>unbounded, out-of-order</b> event stream into per-window results (counts, sums, distinct-counts, top-K, percentiles) as the data flows &mdash; instead of re-running a batch job.</div>
+<div class="field"><b>Reach for it when:</b> real-time metrics, click / impression aggregation, dashboards, trending, billing meters, fraud &mdash; you need a rolling answer over a stream that never ends.</div>
+<div class="field"><b>The lever:</b> bucket events into <b>windows</b> by their <b>event time</b>; keep a per-window <b>partial aggregate</b> in state; use a <b>watermark</b> to decide when a window is complete enough to emit; <b>checkpoint</b> the state so a crash doesn&rsquo;t double-count.</div>
+<div class="newprob"><b>New problem it hands you:</b> state grows with <em>keys × open windows</em>; the watermark is a <b>completeness-vs-latency dial</b>; and <b>late data</b> after the watermark forces a drop / side-output / re-emit choice. State size and delivery semantics become the hard parts.</div>
+<div class="prims"><b>Exemplified by:</b> <a href="../systems/s6.html">Datadog metrics</a>, <a href="../systems/s22.html">Top-K trending</a>, click aggregation; composes <a href="p1.html">P1 batching</a>, <a href="p2.html">P2 partitioning</a>, <a href="p7.html">P7 partial aggregation</a>, <a href="p9.html">P9 idempotency</a>.</div></div>
+
+<hr>
+
+<h2 class="sec">1 &middot; The problem it solves</h2>
+<p>You have an endless stream of events &mdash; clicks, page views, metric points, transactions &mdash;
+and you need a continuously updated answer: <i>&ldquo;clicks per ad per minute,&rdquo; &ldquo;p99 latency this
+5-minute window,&rdquo; &ldquo;distinct users in the last hour,&rdquo; &ldquo;top-10 trending items right
+now.&rdquo;</i> A <b>batch job</b> that recomputes from raw storage is both too slow (minutes-to-hours late)
+and too expensive (it rescans everything each run). What you want is <b>incremental</b> aggregation: fold
+each event into a running result the moment it arrives.</p>
+<p>Two facts make this hard, and they are the whole subject. First, the stream is <b>unbounded</b> &mdash;
+&ldquo;the total count&rdquo; is never final, so you must slice time into <b>windows</b> to ever emit
+anything. Second, events arrive <b>out of order</b>: a click that happened at 12:00:59 can reach you at
+12:01:03, after events from 12:01. So &ldquo;is the 12:00 minute done?&rdquo; is not a question the clock on
+the wall can answer &mdash; you need a principled notion of stream progress. That notion is the
+<b>watermark</b>.</p>
+
+<h2 class="sec">2 &middot; How it works</h2>
+<p>The clean mental model is the <b>Dataflow model</b> (Google): every streaming aggregation answers four
+questions.</p>
+<div class="tablewrap"><table>
+<tr><th>Question</th><th>Answered by</th></tr>
+<tr><td><b>What</b> is computed?</td><td>the aggregation function &mdash; count, sum, a sketch (&sect;3)</td></tr>
+<tr><td><b>Where</b> in event time?</td><td>the <b>window</b> assignment (tumbling / sliding / session)</td></tr>
+<tr><td><b>When</b> in processing time is it emitted?</td><td>the <b>trigger</b> &mdash; usually &ldquo;when the watermark passes the window end&rdquo;</td></tr>
+<tr><td><b>How</b> do refinements relate?</td><td>the <b>accumulation</b> mode &mdash; discard / accumulate / accumulate&amp;retract</td></tr>
+</table></div>
+<h3>Event time vs processing time</h3>
+<p>Every event carries an <b>event-time</b> timestamp (when it actually happened) that is different from its
+<b>processing-time</b> (when your system saw it). Windowing on processing time is trivial but wrong &mdash; a
+network hiccup or a consumer restart would shove events into the wrong bucket and your &ldquo;12:00 minute&rdquo;
+would silently depend on pipeline health. Correct aggregation windows on <b>event time</b>, which is exactly
+what creates the out-of-order problem.</p>
+<h3>Windows, state, and the watermark</h3>
+<p>Each event is routed by key (<a href="p2.html">P2</a> &mdash; same key to same worker, so its state is
+local) and assigned to one or more windows by its event timestamp. Per <code>(key, window)</code> the engine
+keeps a <b>partial aggregate</b> in state and folds each event into it &mdash; storing the <em>combiner</em>
+(a running count/sum/sketch), never the raw events (<a href="p7.html">P7</a>). A <b>watermark</b> is a moving
+lower bound on event time: &ldquo;I believe I have now seen every event with timestamp &le; T.&rdquo; It is
+usually derived as <code>max-seen-event-time &minus; allowed-lag</code>. When the watermark passes a
+window&rsquo;s end, the window is declared complete, its <b>trigger fires</b>, and the aggregate is emitted;
+the state for that window can then be dropped.</p>
+<pre class="mermaid">
+graph LR
+  S[event stream<br/>out of order] --> K{partition by key P2}
+  K --> W[assign to window<br/>by event time]
+  W --> ST[(state:<br/>partial agg per key,window)]
+  WM[watermark<br/>= max_evt_time − lag] --> T{watermark ≥ window end?}
+  ST --> T
+  T -->|yes| E[emit result, evict window]
+  T -->|no| ST
+  CK[periodic checkpoint] -.snapshots.-> ST
+</pre>
+<p>The watermark is the heart of it: it converts &ldquo;wait forever for perfect data&rdquo; into &ldquo;wait a
+bounded, tunable amount, then emit.&rdquo;</p>
+
+<h2 class="sec">3 &middot; Variants &amp; when to use each</h2>
+<h3>Window types</h3>
+<div class="tablewrap"><table>
+<tr><th>Window</th><th>Shape</th><th>Use for</th><th>State cost</th></tr>
+<tr><td><b>Tumbling</b></td><td>fixed size, non-overlapping (each event in exactly one)</td><td>per-minute counts, billing meters</td><td>lowest: 1 open window/key</td></tr>
+<tr><td><b>Sliding / hopping</b></td><td>fixed size, advances by a smaller step &rarr; windows overlap</td><td>&ldquo;last 5 min, updated every 1 min&rdquo; moving averages</td><td>high: each event in <code>size/step</code> windows</td></tr>
+<tr><td><b>Session</b></td><td>dynamic &mdash; bounded by a gap of inactivity</td><td>user sessions, activity bursts</td><td>variable; windows merge as events fill gaps</td></tr>
+<tr><td><b>Global</b></td><td>one window, custom triggers do the slicing</td><td>count/processing-time triggers, custom logic</td><td>depends on trigger</td></tr>
+</table></div>
+<h3>Triggers &amp; accumulation</h3>
+<p>Beyond the default &ldquo;fire on watermark,&rdquo; triggers can fire <b>early</b> (speculative results before the
+window closes, on a processing-time timer or every N events) and <b>late</b> (a refined result when a
+straggler lands after the watermark). Accumulation mode says how those firings relate: <b>discarding</b> (each
+firing is a delta), <b>accumulating</b> (each firing is the full running result, replacing the last), or
+<b>accumulating &amp; retracting</b> (emit a retraction of the old value plus the new &mdash; needed when the
+downstream can&rsquo;t just overwrite).</p>
+<h3>Exact vs sketched aggregates</h3>
+<p><b>What</b> you keep per window matters as much as the window. An exact distinct-count needs the full set of
+keys seen; at high cardinality that state is enormous. So streaming aggregation leans on mergeable
+<b>sketches</b> &mdash; small, fixed-size, approximate summaries:</p>
+<div class="tablewrap"><table>
+<tr><th>Question</th><th>Sketch</th><th>Trades</th></tr>
+<tr><td>distinct count</td><td><b>HyperLogLog</b></td><td>~1&ndash;2% error for ~KB instead of storing every id</td></tr>
+<tr><td>heavy hitters / top-K</td><td><b>Count-Min sketch</b></td><td>over-counts rare keys; nails frequent ones</td></tr>
+<tr><td>quantiles / percentiles</td><td><b>t-digest / DDSketch</b></td><td>bounded relative error; mergeable across partitions</td></tr>
+<tr><td>membership</td><td><b>Bloom filter</b> (<a href="p9.html">P9 §6</a>)</td><td>false positives for tiny memory</td></tr>
+</table></div>
+<p>Sketches are the reason a <a href="../systems/s6.html">metrics system</a> can hold millions of series in RAM:
+they are <b>mergeable</b>, so each partition builds its own and a central step merges them (<a href="p7.html">P7</a>)
+without ever shipping raw points.</p>
+
+<h2 class="sec">4 &middot; The new bottleneck it hands you</h2>
+<div class="newprob">
+<p><b>(a) State size.</b> Aggregation state is <code>keys × open windows × per-window aggregate size</code>.
+High key cardinality or <b>sliding windows</b> (which put each event in many overlapping windows) make it
+explode. Relief escalates: store the <em>combiner</em> not raw events; use <b>sketches</b> (&sect;3) so
+per-window state is fixed-size; back the state with an on-disk store like <b>RocksDB</b> (<a href="p17.html">P17</a>)
+so it can exceed RAM; and aggressively <b>evict</b> windows once the watermark closes them (so tumbling beats
+sliding, and sessions must be able to expire).</p>
+<p><b>(b) The watermark is a completeness-vs-latency dial.</b> Advance it aggressively (small allowed lag) and
+you emit fast but close windows before stragglers arrive &rarr; <b>undercount</b>. Advance it conservatively and
+results are correct but <b>late</b>. Worse, a watermark is the <b>minimum</b> across all input partitions, so a
+single <b>idle or lagging partition holds back the whole pipeline</b> &mdash; no windows anywhere can close.
+Idle-source detection and per-partition watermark tracking exist precisely to stop one stuck shard from freezing
+all output.</p>
+<p><b>(c) Late data.</b> Once the watermark has passed a window, an event for that window is <b>late</b>, and you
+must pick a policy: <b>drop</b> it (fast, lossy &mdash; and silent unless you count drops), route it to a
+<b>side-output</b> for separate reconciliation, or set an <b>allowed-lateness</b> and <b>re-emit</b> the updated
+window. Re-emission means the downstream sees the same window twice with different values, so it must be
+<b>idempotent or able to retract</b> (<a href="p9.html">P9</a>) &mdash; upsert by <code>(key, window)</code>,
+don&rsquo;t <code>+=</code>.</p>
+<p><b>(d) Exactly-once over stateful operators.</b> Because the aggregate <em>is</em> state, recovery after a
+crash must restore state that is consistent with the input position, or you double-count on replay. That is the
+checkpointing problem below &mdash; the hardest correctness property in the whole primitive.</p>
+</div>
+<h3>Checkpointing: consistent snapshots of distributed state</h3>
+<p>The engine periodically snapshots every operator&rsquo;s state <em>together with</em> the input offsets that
+produced it, so on failure it restores all state and rewinds the sources to the matching offsets &mdash;
+exactly-once with respect to state. The elegant trick (Flink&rsquo;s, below) is to inject numbered
+<b>barriers</b> into the stream: when an operator has received the barrier on all its inputs, it snapshots its
+state and forwards the barrier. The barrier cleanly separates &ldquo;events before the snapshot&rdquo; from
+&ldquo;events after,&rdquo; so the snapshot is globally consistent without stopping the world &mdash; a variant of
+the <b>Chandy-Lamport</b> distributed-snapshot algorithm.</p>
+
+<h2 class="sec">5 &middot; Real-world example</h2>
+<div class="example">
+<span class="tag">Apache Flink</span>
+<p>Flink is the reference implementation of this primitive. It processes in <b>event time</b> with watermarks,
+keeps large keyed state in an embedded <b>RocksDB</b> state backend (so aggregation state spills to local disk
+and can far exceed RAM), and gets exactly-once via <b>asynchronous barrier snapshotting</b> &mdash; its variant
+of Chandy-Lamport. The checkpoint coordinator has sources record their offsets and inject numbered
+<b>checkpoint barriers</b> into the stream; each operator, once it has aligned the barrier across its inputs,
+copies its state asynchronously (RocksDB&rsquo;s copy-on-write enables <b>incremental</b> snapshots of only the
+changed state) and forwards the barrier. On failure the job restarts from the last checkpoint and the sources
+rewind to the recorded offsets, so no event is double-counted. Alibaba runs Flink for real-time analytics at
+Singles&rsquo; Day scale (billions of events/s peaks), and it underpins streaming pipelines at Netflix, Uber,
+and Pinterest.</p>
+</div>
+<div class="example">
+<span class="tag">Google MillWheel / Dataflow</span>
+<p>The <b>watermark</b> abstraction this whole page rests on was formalized by Google&rsquo;s <b>MillWheel</b> and
+the <b>Dataflow model</b> (Akidau et al.). A watermark is the threshold at which Dataflow expects all data for a
+window to have arrived; when it passes the window end the window fires, and anything arriving afterward is
+<b>late data</b> handled by triggers and accumulation. MillWheel&rsquo;s own note is instructive: most aggregate
+pipelines don&rsquo;t need 100% accuracy &mdash; they want a <em>mostly complete</em> view in a reasonable time,
+which is exactly the completeness-vs-latency trade the watermark exposes. This model is now the industry
+vocabulary (adopted by Apache Beam and, in spirit, by Flink).</p>
+</div>
+
+<h2 class="sec">6 &middot; Applying it in a design</h2>
+<p>When a system needs real-time rollups, say the sentence that shows you understand the trade:
+<i>&ldquo;I&rsquo;ll aggregate in <b>event-time</b> windows, keyed and partitioned so state is local, holding a
+<b>partial aggregate</b> (a sketch when cardinality is high) in <b>checkpointed</b> state per
+<code>(key, window)</code>; fire on the <b>watermark</b> with a bounded <b>allowed-lateness</b> and a
+side-output for stragglers, and make the sink idempotent so re-emissions upsert rather than double-count.&rdquo;</i>
+This is the standard answer for click aggregation, <a href="../systems/s6.html">metrics</a>, billing meters, and
+<a href="../systems/s22.html">real-time trending</a>. It sits directly downstream of <a href="../systems/s2.html">Kafka</a>:
+the log gives you replayable, partitioned, ordered-per-key input; this primitive turns that stream into answers.</p>
+
+<h2 class="sec">7 &middot; Pitfalls</h2>
+<ul>
+<li>Windowing on <b>processing time</b> when you mean event time &mdash; results silently depend on pipeline lag.</li>
+<li><b>Unbounded state</b>: no window eviction, a session gap that never closes, or storing raw events instead of a combiner.</li>
+<li>One <b>idle/lagging partition</b> stalling the global watermark, freezing all output &mdash; forgetting idle-source handling.</li>
+<li>No <b>late-data policy</b> &rarr; silent undercount; dropping late events without counting the drops.</li>
+<li><b>Sliding-window</b> state blow-up (each event in <code>size/step</code> windows) &mdash; use tumbling or a sketch if you can.</li>
+<li>Re-emitting refined windows into a <b>non-idempotent</b> sink (<code>+=</code> instead of upsert by <code>(key,window)</code>) &rarr; double counting.</li>
+<li>Treating an approximate sketch as exact &mdash; know the error bound before you put it on a billing invoice.</li>
+</ul>
+
+<h2 class="sec">8 &middot; Further reading</h2>
+<ul>
+<li><a href="https://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf">The Dataflow Model</a> (Akidau et al., VLDB 2015) &middot; <a href="https://research.google/pubs/pub41378/">MillWheel</a></li>
+<li><a href="https://www.oreilly.com/radar/the-world-beyond-batch-streaming-101/">Streaming 101</a> &amp; <a href="https://www.oreilly.com/radar/the-world-beyond-batch-streaming-102/">Streaming 102</a> (Akidau) &mdash; event time, watermarks, triggers</li>
+<li><a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/learn-flink/fault_tolerance/">Flink &mdash; Fault tolerance via state snapshots</a> (barrier snapshotting, RocksDB backend)</li>
+<li><a href="../systems/s6.html">S6 metrics (DDSketch)</a> · <a href="../systems/s22.html">S22 top-K trending</a> · <a href="../systems/s2.html">S2 Kafka</a> (the upstream log)</li>
+</ul>
+
+<div class="prevnext"><a href="p20.html">&larr; P20 &middot; Distributed tracing</a><a href="../systems/s1.html">S1 &middot; Rate limiter &rarr;</a></div>
+</div></main>
+</div>
+<a href="#top" class="backtop" title="Back to top">&uarr;</a>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'neutral' });
+</script>
+<script>window.SITE_BASE="../";</script>
+<script src="../assets/site.js"></script>
+</body></html>

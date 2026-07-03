@@ -98,17 +98,86 @@ graph LR
 <h2 class="sec">9 · Consumer-group rebalancing</h2>
 <div class="newprob"><b>New bottleneck &mdash; rebalancing pauses.</b> When a consumer joins/leaves/crashes, the group must reassign partitions. The classic <b>eager</b> protocol is stop-the-world: all consumers revoke all partitions, then re-acquire &mdash; the whole group pauses, and at scale (hundreds of consumers) that's a noticeable outage on every deploy. Relief: <b>cooperative/incremental rebalancing</b> (only the moved partitions are revoked, the rest keep processing) and <b>static membership</b> (a consumer keeps its identity across a brief restart so a rolling deploy doesn't trigger a reassignment at all). This is the real-world reason a naive "just add consumers" answer is incomplete &mdash; the rebalance cost is part of the design.</div>
 
-<h2 class="sec">10 · Tradeoffs &amp; alternatives</h2>
+<h2 class="sec">10 · Failure modes &amp; operational bottlenecks</h2>
+<p>Everything above is the happy path plus its immediate bottleneck. In practice a Kafka pipeline fails in a
+dozen specific ways, and the dangerous ones are <b>silent</b> &mdash; no exception, just wrong or missing data.
+Here is the consolidated catalog, by stage. Each row is <em>symptom &rarr; cause &rarr; the knob that fixes
+it</em>.</p>
+
+<h3>Producer side</h3>
+<div class="tablewrap"><table>
+<tr><th>Failure</th><th>Cause</th><th>Fix</th></tr>
+<tr><td><b>Silent reordering</b> within a partition</td><td><code>max.in.flight.requests &gt; 1</code> + retries: a retried batch can land after a later one</td><td><code>enable.idempotence=true</code> (bounds in-flight, dedups by producer-id + sequence, preserves order)</td></tr>
+<tr><td><b>Lost writes</b> on broker failure</td><td><code>acks=0/1</code> acks before replicas have the data; leader dies → gone</td><td><code>acks=all</code> + <code>min.insync.replicas=2</code> (<a href="../primitives/p3.html">P3</a>)</td></tr>
+<tr><td><b>Producer stalls / throws</b></td><td><code>buffer.memory</code> fills when brokers slow; producer blocks up to <code>max.block.ms</code> then errors &mdash; backpressure surfacing at the edge (<a href="../primitives/p16.html">P16</a>)</td><td>size the buffer, handle the block, or shed load upstream</td></tr>
+<tr><td><b>Rejected large message</b></td><td>payload &gt; <code>max.request.size</code> / broker <code>message.max.bytes</code></td><td>keep messages small; <b>claim-check</b> pattern &mdash; put the blob in object storage, send a pointer</td></tr>
+<tr><td><b>Throughput collapse</b></td><td>tiny batches, no compression → per-message overhead dominates</td><td><code>linger.ms</code> + <code>batch.size</code> + <code>compression.type</code> (<a href="../primitives/p1.html">P1</a>)</td></tr>
+<tr><td><b>Zombie double-produce</b></td><td>a network-partitioned producer resumes and re-sends after a new instance took over</td><td>transactional <code>transactional.id</code> with epoch <b>fencing</b> (<a href="../primitives/p10.html">P10</a>)</td></tr>
+</table></div>
+
+<h3>Broker / cluster</h3>
+<div class="tablewrap"><table>
+<tr><th>Failure</th><th>Cause</th><th>Fix</th></tr>
+<tr><td><b>Producers start failing</b> (acks=all)</td><td>followers fall behind → <b>ISR shrinks</b> below <code>min.insync.replicas</code>; the partition rejects writes (durability chosen over availability)</td><td>alert on <code>UnderReplicatedPartitions</code>; fix slow/over-loaded followers; right-size RF</td></tr>
+<tr><td><b>Committed-data loss</b></td><td><b>unclean leader election</b>: all ISR died, an out-of-sync replica is promoted leader, losing acked records</td><td>keep <code>unclean.leader.election.enable=false</code> unless you truly prefer availability to durability</td></tr>
+<tr><td><b>Partition-count wall</b></td><td>parallelism capped by partitions; you can add but <b>never shrink</b>, and adding remaps keys → disrupts ordering &amp; partition-local state</td><td>size for peak with headroom up front (&sect;3); split hot keys, don&rsquo;t just add partitions</td></tr>
+<tr><td><b>Hot partition</b></td><td>a skewed key floods one partition; its single consumer lags while others idle (<a href="../primitives/p2.html">P2</a>)</td><td>composite key or split-and-merge downstream (&sect;6)</td></tr>
+<tr><td><b>Broker down / cascading</b></td><td>disk fills from retention, or GC/IO pauses; a downed broker triggers leader elections and load shift</td><td>disk quotas, retention limits, spread partitions, monitor controller/leader-election time</td></tr>
+<tr><td><b>Slow failover at scale</b></td><td>very high partition counts stress metadata (ZooKeeper, or the <b>KRaft</b> controller quorum) → long leader elections</td><td>bound partitions per broker; KRaft for faster metadata (<a href="../primitives/p10.html">P10</a>)</td></tr>
+</table></div>
+
+<h3>Consumer side</h3>
+<div class="tablewrap"><table>
+<tr><th>Failure</th><th>Cause</th><th>Fix</th></tr>
+<tr><td><b>Duplicate reprocessing</b> (the classic)</td><td>processing a batch takes longer than <code>max.poll.interval.ms</code> → the broker thinks the consumer died, evicts it, <b>rebalances</b>, and its partitions are replayed elsewhere</td><td>smaller <code>max.poll.records</code>, faster processing, or a longer interval; make work idempotent (<a href="../primitives/p9.html">P9</a>)</td></tr>
+<tr><td><b>Both lost <em>and</em> duplicated</b></td><td><code>enable.auto.commit</code> commits offsets on a timer regardless of whether processing finished</td><td>turn auto-commit off; commit <b>manually after</b> processing (defines at-least-once)</td></tr>
+<tr><td><b>Head-of-line blocking</b></td><td>one slow or bad message stalls its whole partition (strict offset order); can&rsquo;t skip it</td><td>route to DLQ after N tries (below); parallelizing within a partition trades away ordering</td></tr>
+<tr><td><b>Consumer lag grows unbounded</b></td><td>slow processing, GC pauses, too few partitions, or a poison message blocking</td><td>scale consumers (≤ partitions), profile, DLQ the poison; alert on lag <em>vs retention headroom</em></td></tr>
+<tr><td><b>Rebalance storms</b></td><td>every deploy/scale/slow-heartbeat reassigns partitions, pausing the group (&sect;9)</td><td><b>cooperative-sticky</b> assignor + <b>static membership</b> (<code>group.instance.id</code>)</td></tr>
+<tr><td><b>Offset-reset surprise</b></td><td>a new consumer or an expired offset hits <code>auto.offset.reset</code>: <code>latest</code> skips the backlog, <code>earliest</code> reprocesses everything</td><td>choose deliberately per use case; don&rsquo;t leave it to default</td></tr>
+</table></div>
+
+<h3>Data lifecycle &amp; delivery semantics</h3>
+<div class="tablewrap"><table>
+<tr><th>Failure</th><th>Cause</th><th>Fix</th></tr>
+<tr><td><b>Silent data loss</b> (the quiet killer)</td><td>a consumer is down or lagging past <code>retention.ms</code>/<code>retention.bytes</code> → unread messages are <b>deleted on a clock</b>, no error, just a gap</td><td>alert on lag approaching retention; size retention for worst-case outage; tiered/long retention for critical topics</td></tr>
+<tr><td><b>EOS doesn&rsquo;t reach the sink</b></td><td>Kafka transactions cover only consume→transform→<b>produce-to-Kafka</b>; an external DB/S3/index is outside the transaction</td><td>at-least-once + idempotent sink (<a href="../primitives/p9.html">P9</a>); reconcile against the external system</td></tr>
+<tr><td><b>Compaction surprises</b></td><td>a log-compacted topic keeps only the latest value per key; consumers expecting full history see gaps; tombstones expire</td><td>use compaction only for changelog/snapshot semantics; understand <code>delete.retention.ms</code> for tombstones</td></tr>
+</table></div>
+
+<h3>Poison messages &amp; the DLQ</h3>
+<div class="newprob"><b>Fast-fail to a dead-letter queue, but mind its own failure modes.</b> A <b>poison message</b> &mdash;
+one that always fails deserialization or processing &mdash; will block its partition forever if you keep
+retrying it in place (head-of-line blocking). The pattern is: <b>bounded</b> in-place retries for transient
+errors, then route the message to a <b>retry topic</b> (with backoff) or a <b>DLQ</b> and advance the offset so
+the partition keeps flowing. The DLQ has its own traps: messages arrive <b>out of order</b>, naive immediate
+retry creates an <b>infinite loop</b>, the DLQ can silently <b>back up</b>, and you need <b>replay tooling</b>
+plus alerting on its depth. A DLQ without monitoring is just a place data goes to die unnoticed.</div>
+
+<h3>Schema &amp; multi-cluster</h3>
+<div class="tablewrap"><table>
+<tr><th>Failure</th><th>Cause</th><th>Fix</th></tr>
+<tr><td><b>All consumers crash at once</b></td><td>a producer ships a breaking payload change that deserializers can&rsquo;t read</td><td><b>Schema Registry</b> with enforced backward/forward compatibility; never remove/rename required fields</td></tr>
+<tr><td><b>Loss / dupes on region failover</b></td><td>cross-cluster replication (MirrorMaker 2) lags and offsets differ between clusters</td><td>offset translation, accept at-least-once across regions, reconcile</td></tr>
+</table></div>
+
+<div class="note"><b>The three silent killers to name in an interview:</b> <b>retention expiry</b> deleting unconsumed
+data, <b>rebalance storms</b> pausing the group on every deploy, and <b><code>max.poll.interval</code>
+eviction</b> causing duplicate reprocessing. None throws an obvious error, so each is a monitoring problem before
+it is a code problem &mdash; alert on consumer lag vs retention headroom, rebalance rate, and processing time per
+poll.</div>
+
+<h2 class="sec">11 · Tradeoffs &amp; alternatives</h2>
 <p>If you need per-message acknowledgement, complex routing, or priority queues, a traditional broker (RabbitMQ) or a managed queue (<a href="../systems/s12.html">SQS</a>) fits better than a log &mdash; Kafka deliberately trades those for throughput and replay. If you need millions of independent low-throughput queues, the per-partition overhead hurts. If you need strict <b>global</b> ordering across all keys, you're forced to a single partition and lose all parallelism &mdash; a sign the requirement itself should be questioned. Pull (consumer-paced, replayable, simple backpressure) vs push (lower latency, harder flow control) is the deep transport choice; Kafka chose pull, which is why the log can be the shock absorber.</p>
 
-<h2 class="sec">11 · Real-world example</h2>
+<h2 class="sec">12 · Real-world example</h2>
 <div class="example">
 <span class="tag">LinkedIn</span>
 <p>Kafka was built at LinkedIn (~2010) to unify a sprawl of point-to-point data pipelines into one central log: every event &mdash; page views, metrics, database changes &mdash; published once and consumed by many systems (search, analytics, monitoring, Hadoop). The log-as-backbone idea is laid out in Jay Kreps' essay <a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying-abstraction">"The Log."</a> LinkedIn has reported running Kafka at the scale of <em>trillions</em> of messages per day across thousands of brokers &mdash; the existence proof that an append-only, partitioned, page-cache-served log scales far past what a traditional broker (RabbitMQ, ActiveMQ) reaches.</p>
 </div>
 <div class="note">Modern Kafka can replace ZooKeeper with the built-in <b>KRaft</b> consensus mode for metadata &mdash; the controller quorum uses Raft (<a href="../primitives/p10.html">P10</a>), folding leader election and metadata storage into Kafka itself.</div>
 
-<h2 class="sec">12 · Interview follow-ups (Q&amp;A)</h2>
+<h2 class="sec">13 · Interview follow-ups (Q&amp;A)</h2>
 <p><b>Q: How do you add consumer parallelism, and what's the limit?</b> Add consumers to the group up to the number of partitions; beyond that they idle. To go higher you must add partitions, which remaps keys and disrupts ordering during the change &mdash; so size partitions for peak with headroom from the start.</p>
 <p><b>Q: How does Kafka guarantee ordering?</b> Only <em>per partition</em>: one consumer reads a partition in strict offset order, and a key always hashes to the same partition. There is no global order across partitions &mdash; and you almost never need one.</p>
 <p><b>Q: A committed message must never be lost &mdash; how?</b> Replication factor 3 with <code>acks=all</code> and <code>min.insync.replicas=2</code>: a write isn't acked until 2 in-sync replicas have it, surviving one broker loss. It trades a little latency for durability (<a href="../primitives/p3.html">P3</a> dial).</p>
@@ -117,7 +186,7 @@ graph LR
 <p><b>Q: Why does every deploy cause a latency blip?</b> Eager rebalancing stops the whole group to reassign partitions when membership changes. Use cooperative/incremental rebalancing and static membership so a rolling restart moves only affected partitions (or none).</p>
 <p><b>Q: A consumer was down for hours &mdash; does it lose messages?</b> No &mdash; retention is decoupled from consumption, so it resumes from its committed offset and replays the backlog (consumer lag), as long as the data is still within the retention window.</p>
 
-<h2 class="sec">13 · Key talking points</h2>
+<h2 class="sec">14 · Key talking points</h2>
 <ul>
 <li>Lead with the ceiling: <i>"parallelism = partition count, so I'll size partitions for peak consumer throughput with headroom."</i></li>
 <li>Append-only log = sequential writes; page cache + zero-copy reads (<a href="../primitives/p17.html">P17</a>).</li>
@@ -127,11 +196,12 @@ graph LR
 <li>Retention = replay buffer; compaction = changelog; rebalancing cost is part of the design.</li>
 </ul>
 
-<h2 class="sec">14 · Further reading</h2>
+<h2 class="sec">15 · Further reading</h2>
 <ul>
 <li><a href="https://kafka.apache.org/documentation/">Apache Kafka documentation</a></li>
 <li><a href="https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying-abstraction">Jay Kreps — The Log</a></li>
 <li><a href="https://kafka.apache.org/documentation/#design">Kafka design</a> (page cache, zero-copy, ISR) · <a href="https://kafka.apache.org/documentation/#producerconfigs">producer configs</a></li>
+<li>Downstream: <a href="../primitives/p21.html">P21 streaming aggregation</a> turns this log into real-time rollups (windows, watermarks, exactly-once state).</li>
 </ul>
 
 <div class="prevnext">

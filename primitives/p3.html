@@ -102,23 +102,127 @@ DynamoDB lets you pay less for staleness; Spanner pays latency for global strong
 consistency.</p>
 </div>
 
-<h2 class="sec">7 &middot; Applying it in a design</h2>
+<h2 class="sec">7 &middot; Replicating read-only config: local evaluation &amp; where &ldquo;serve stale&rdquo; fails</h2>
+<p>Replication is not only for databases. A large class of systems replicate a
+<em>read-only control plane</em> &mdash; feature-flag rules, routing tables, auth
+policies, service-discovery state &mdash; out to every application process so that
+hot-path reads are answered <b>locally, in memory, with zero network hops</b>. It is
+the same single-leader async pattern as <a href="#top">Rung&nbsp;1</a>: a backend is the
+sole writer, and the &ldquo;followers&rdquo; are your app servers. The twist is that the
+replicated artifact is a <em>rule set</em>, not rows, and the replica is re-evaluated
+against every request rather than read out directly.</p>
+
+<h4>Derive it as a ladder</h4>
+<p>Start with the simplest thing and watch it break.</p>
+<div class="estimate">Rung 0 &mdash; call the control-plane API on every check.
+  correct and always fresh, but each check is a network round-trip on the hot path.
+  1 flag check per request &times; 5k req/s &times; 50 app servers = 250k calls/s into the
+  config service, each adding ~1&ndash;50 ms RTT to <em>your</em> latency.
+  → dies on both latency and fan-in almost immediately.
+
+Rung 1 &mdash; replicate the whole rule set to each process, evaluate locally.
+  init: one fetch of all rules into memory; every check is then 0 hops, ~microseconds.
+  refresh: a background thread re-pulls the rule set every ~10 s and swaps it in atomically.
+  cost: eventual consistency — a rule edit is invisible until each replica's next poll
+        (bounded staleness ≈ the poll interval), and reads never touch the primary.</div>
+<p>Rung&nbsp;1 is the standard answer, and it is a textbook consistency-ladder trade: you
+accept <b>~10&nbsp;s of staleness</b> (a rung of <em>bounded staleness</em> from
+&sect;3) to buy zero-hop reads and read availability that survives the primary being slow
+or briefly unreachable. The exposure/event telemetry flows the other direction on its own
+schedule &mdash; buffered and flushed on an interval &mdash; which is
+<a href="../primitives/p1.html">P1 batching</a>, not replication; keeping the two paths
+distinct is the whole point.</p>
+
+<h4>Where &ldquo;serve last-known-good&rdquo; quietly fails</h4>
+<p>The reassuring property of async replication is graceful degradation: if a poll fails,
+the replica keeps evaluating against the copy it already holds. That intuition is correct
+&mdash; but it only protects you against failures the replica <em>recognizes as
+failures</em>. Two gaps slip past it, and both surfaced in a real incident where a
+feature-flag SDK key was deleted and every gate in production started returning
+<code>false</code>.</p>
+
+<div class="estimate">Failure A — cold start (a replica with no snapshot).
+  A process that boots *after* the key is deleted never completes its init fetch (401).
+  There is no last-known-good to fall back to — the replica is empty from birth — and an
+  unknown gate defaults to false. Any pod that autoscaled, redeployed, or crash-looped
+  came up blank; pods initialized *before* the deletion kept serving correct values.
+  → the outage looked staggered, not instant, which is the tell for this mode.
+
+Failure B — authoritative-empty (the primary replicates "nothing", successfully).
+  Depending on SDK version, the endpoint answers 200 with an empty rule set because the
+  key no longer maps to a project. That is not an error the replica rejects — it is a
+  *successful* update — so it atomically overwrites good in-memory state with empty.
+  → even a long-lived, already-initialized replica flips to false.</div>
+
+<p>The distinction is the P3 lesson worth remembering: <b>stale-read tolerance defends
+against transport failures, not against a cold replica or against an authoritative
+&ldquo;there is nothing here.&rdquo;</b> A dropped poll is safe; a poll that succeeds and
+returns emptiness is not. This is the same family of hazard as last-writer-wins in
+&sect;4 &mdash; a well-formed write (here, of nothing) silently destroying good state.</p>
+
+<h4>The fixes, in replication terms</h4>
+<p>Both holes have standard patches, and both are ordinary replication ideas:</p>
+<table>
+<thead><tr><th>Hole</th><th>Patch</th><th>Why it&rsquo;s a replication primitive</th></tr></thead>
+<tbody>
+<tr><td>Cold start with no snapshot</td><td><b>Bootstrap / seed</b> the replica from a
+secondary source (a rules blob in S3/Redis/a baked-in file) at init</td><td>Seeding a new
+follower from a snapshot before it joins the stream &mdash; exactly how a database bootstraps
+a fresh replica instead of starting empty.</td></tr>
+<tr><td>Authoritative-empty overwrite</td><td><b>Explicit per-read defaults</b> at the call
+site, and treating &ldquo;empty rule set&rdquo; as suspect rather than authoritative</td>
+<td>Choosing the safe state when the replica can&rsquo;t be trusted &mdash; the same
+availability-vs-correctness call CAP forces under partition.</td></tr>
+</tbody>
+</table>
+<p>Note the second fix is really a design decision, not a config toggle: for a
+kill-switch gate, <code>false</code> means &ldquo;feature off,&rdquo; so an empty replica
+fails <em>closed</em>; for an entitlement gate, <code>false</code> might lock every user
+out. Decide the safe direction per gate rather than inheriting the SDK&rsquo;s implicit
+default.</p>
+
+<div class="example">
+<span class="tag">Statsig feature flags</span>
+<p>Statsig&rsquo;s server SDKs are a clean instance of this whole pattern. <code>initialize()</code>
+pulls the entire rule set via <code>download_config_specs</code>; every
+<code>checkGate()</code> is then evaluated <b>locally</b> against in-memory rules with no
+network call, and a background thread re-polls on a <b>~10&nbsp;s</b> default interval
+(configurable, e.g. Go&rsquo;s <code>ConfigSyncInterval</code>) &mdash; async single-leader
+replication of a control plane. Exposures and events flow back <b>batched on a ~60&nbsp;s
+flush</b> (or on <code>shutdown()</code>), the P1 half of the design. Statsig supports
+<b>bootstrapping from a data adapter</b> (Redis/S3) precisely so a process that can&rsquo;t
+reach the origin comes up seeded instead of empty &mdash; the Failure-A patch above. When an
+SDK key is deleted, newly started processes fail auth at init and evaluate every gate to its
+default <code>false</code>, which is the exact cold-start hole that bootstrap seeding and
+explicit defaults are there to close.</p>
+</div>
+<div class="note">At very large fleets, per-process polling itself becomes a fan-in
+bottleneck on the config origin &mdash; thousands of replicas each pulling every 10&nbsp;s.
+The next rung is a <b>proxy/CDN tier</b>: one process fetches specs and serves the fleet, or
+replicas read from a CDN/edge cache. That is <a href="../primitives/p11.html">P11 edge
+caching</a> layered on top of P3 &mdash; another lever, another bottleneck.</div>
+
+<h2 class="sec">8 &middot; Applying it in a design</h2>
 <p>State the requirement first, then pick the rung: <i>"this counter can be eventually
 consistent, so I&rsquo;ll read from any replica; this balance must be read-your-writes,
 so I&rsquo;ll pin the user to the leader or wait for a version."</i></p>
 
-<h2 class="sec">8 &middot; Pitfalls</h2>
+<h2 class="sec">9 &middot; Pitfalls</h2>
 <ul>
 <li>Defaulting to "strong consistency everywhere" and eating needless latency.</li>
 <li>Last-writer-wins silently losing concurrent updates.</li>
 <li>Reading your own writes from a lagging replica.</li>
+<li>Assuming a replica &ldquo;serves last-known-good&rdquo; on failure &mdash; it doesn&rsquo;t
+survive a cold start (nothing to serve) or an authoritative-empty response (overwrites good
+state). Seed replicas and set explicit defaults.</li>
 </ul>
 
-<h2 class="sec">9 &middot; Further reading</h2>
+<h2 class="sec">10 &middot; Further reading</h2>
 <ul>
 <li><a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html">DynamoDB read consistency</a></li>
 <li><a href="https://research.google/pubs/pub39966/">Spanner: Google&rsquo;s Globally-Distributed Database</a></li>
 <li>Martin Kleppmann, <i>Designing Data-Intensive Applications</i>, ch. 5&ndash;9</li>
+<li><a href="https://docs.statsig.com/server/introduction">Statsig server SDKs &mdash; local evaluation, config-spec polling &amp; bootstrap</a></li>
 </ul>
 
 <div class="prevnext"><a href="p2.html">&larr; P2 &middot; Partitioning / hot-key</a><a href="p4.html">P4 &middot; Caching &rarr;</a></div>

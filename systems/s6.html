@@ -13,8 +13,8 @@
 
 <div class="summary">
 <div class="hard"><b>Hard constraint:</b> cardinality — the number of unique tag combinations, not the point rate, drives cost and scalability.</div>
-<div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p1.html">P1</a>, <a href="../primitives/p6.html">P6</a>, <a href="../primitives/p7.html">P7</a>, <a href="../primitives/p8.html">P8</a>, <a href="../primitives/p5.html">P5</a>, <a href="../primitives/p16.html">P16</a>, <a href="../primitives/p17.html">P17</a>, <a href="../primitives/p9.html">P9</a>, <a href="../primitives/p12.html">P12</a>, <a href="../primitives/p2.html">P2</a>.</div>
-<p>Push vs pull collection; agent-side batching + pre-aggregation; mergeable sketches; Gorilla compression; inverted index on tag space; columnar TSDB; logs index-vs-archive; head- vs tail-based trace sampling; the three pillars correlated on trace context; scatter-gather MPP with pushdown.</p>
+<div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p1.html">P1</a>, <a href="../primitives/p6.html">P6</a>, <a href="../primitives/p7.html">P7</a>, <a href="../primitives/p8.html">P8</a>, <a href="../primitives/p5.html">P5</a>, <a href="../primitives/p16.html">P16</a>, <a href="../primitives/p17.html">P17</a>, <a href="../primitives/p9.html">P9</a>, <a href="../primitives/p12.html">P12</a>, <a href="../primitives/p2.html">P2</a>, <a href="../primitives/p4.html">P4</a>.</div>
+<p>Push vs pull collection; agent-side batching + pre-aggregation; mergeable sketches; Gorilla compression; inverted index on tag space; columnar TSDB; immutability-driven result caching; logs index-vs-archive; head- vs tail-based trace sampling; the three pillars correlated on trace context; scatter-gather MPP with pushdown.</p>
 </div>
 
 <hr>
@@ -38,7 +38,7 @@ from high-resolution recent to cheap long-term.</p>
 under load; recent queries are interactive (sub-second to seconds); recent data is durable
 while old data can be lossy-rolled-up; ingest is <b>at-least-once with idempotent points</b>
 (a re-sent flush must not double-count). The cost axis to bound everywhere is
-<b>cardinality</b> (§9).</p>
+<b>cardinality</b> (§10).</p>
 
 <h2 class="sec">2 · Capacity estimation</h2>
 <p>Numbers first — they justify every later choice, and they explain why the three pillars
@@ -52,12 +52,12 @@ get three different storage strategies.</p>
 LOGS
   2,000,000 hosts × ~5 logs/s                = 1×10^7 logs/s
   × ~1 KB/log                                ≈ 10 GB/s ≈ 864 TB/day raw   (a log ≈ 62× a metric point!)
-  → can't index all → archive 100%, index ~5%  (decouple ingest from index, §10)
+  → can't index all → archive 100%, index ~5%  (decouple ingest from index, §11)
 
 TRACES
   1,000,000 req/s × ~20 spans/trace          = 2×10^7 spans/s
   × ~500 B/span                              ≈ 10 GB/s ≈ 864 TB/day raw
-  → sample: head 1% → 2×10^5 spans/s stored;  tail buffer = 2×10^7×10s×500B ≈ 100 GB (§11)
+  → sample: head 1% → 2×10^5 spans/s stored;  tail buffer = 2×10^7×10s×500B ≈ 100 GB (§12)
 
 CARDINALITY (the actual cost driver, all three pillars)
   10 tags × 10 values each                   = 10^10 potential series
@@ -67,7 +67,7 @@ rate</b>, so you aggregate before the wire (<a href="../primitives/p1.html">P1</
 Logs and traces are <b>huge and high-cardinality</b> — orders of magnitude more bytes than
 metrics — so you cannot index them wholesale; you archive cheaply and index/sample
 selectively. (3) What blows up cost across all three is <b>cardinality</b>, not raw point
-rate (§9).</p>
+rate (§10).</p>
 
 <h2 class="sec">3 · API design</h2>
 <p>Four surfaces: three fire-and-forget <b>submit</b> paths (one per pillar, always
@@ -93,14 +93,14 @@ GET /api/v1/trace/{trace_id}</div>
 <p>The metric query language carries the whole shape of the system: an <b>aggregator</b>
 (<code>p99</code>), a <b>metric</b>, a <b>tag filter</b> (resolved through the inverted
 index), and a <b>group-by</b> (the scatter-gather grouping key). The log search reads like
-a search engine query (facets + full-text), because that is exactly what it is (§10).</p>
+a search engine query (facets + full-text), because that is exactly what it is (§11).</p>
 
 <h2 class="sec">4 · Data model &amp; store selection (metrics)</h2>
 <p>A metric point is logically <code>(series_key, timestamp, value)</code>, where
 <b>series_key</b> = metric name + sorted tag set. The honest way to pick a store is
 <b>start with SQL and escalate only when it breaks</b> — not "NoSQL because time-series."
 Walk the ladder, anchored to 4×10<sup>7</sup> points/s from §2. (Logs and traces land on
-different stores — §10, §11.)</p>
+different stores — §11, §12.)</p>
 
 <h4>Rung 0 — one SQL table <span style="font-weight:400">(right default at small scale)</span></h4>
 <p><code>points(series_key, ts, value)</code>, composite B-tree index on
@@ -186,7 +186,7 @@ rolled up, indexed by tag, and written to a columnar TSDB; logs are parsed and s
 between a search index (the few you choose to index) and a cheap archive (everything);
 traces are assembled by <code>trace_id</code>, sampled, and stored. Queries resolve through
 the relevant index, scatter across shards, aggregate partials, and gather. The pillars are
-stitched back together at query time by shared <code>trace_id</code> + tags (§12).</p>
+stitched back together at query time by shared <code>trace_id</code> + tags (§13).</p>
 
 <h2 class="sec">6 · Collection model — push vs pull</h2>
 <p>Before the data is aggregated, you choose how it's <em>collected</em>. This is a classic
@@ -199,7 +199,7 @@ they happen, not pollable state. <b>Pros:</b> works for <b>ephemeral/short-lived
 scrape later); firewall/NAT-friendly (outbound only); and it crosses <b>trust boundaries</b>
 — a SaaS vendor can't reach <em>into</em> a customer's private network, but the customer's
 agent can push <em>out</em>. <b>Cons:</b> the server can be <b>flooded</b> (no rate control —
-you need backpressure, §16); target discovery is implicit; and a silent target is ambiguous
+you need backpressure, <a href="../primitives/p16.html">P16</a>); target discovery is implicit; and a silent target is ambiguous
 — is it healthy-but-quiet or dead?</p>
 <h4>Pull — the server scrapes targets on a schedule</h4>
 <p>The <b>Prometheus</b> model: the server discovers targets via service discovery and
@@ -299,7 +299,86 @@ fails its budget if <em>any one</em> is slow: with each shard 1% likely slow, P(
 hedged requests above p95 and keeping recent blocks in RAM. Older data reads from the cold
 object-store tier at coarser rolled-up resolution.</div>
 
-<h2 class="sec">9 · The hard constraint, in depth: cardinality</h2>
+<h2 class="sec">9 · Caching — where reads get served from memory (the ladder)</h2>
+<p>The read path in §8 recomputes from storage on every call: resolve postings, scatter to
+value shards, decode Gorilla blocks, aggregate. That's fine at low query volume and ruinous
+at real volume — because the read workload is dominated by <b>repetition</b>, not by unique
+questions. Dashboards auto-refresh every ~10–30 s, thousands of monitors re-run the
+<em>same</em> windowed query every tick, and everyone stares at the same "last 1h" of the
+same few services. Derive the cache layers rung by rung; the guiding fact is that
+<b>time-series data is highly cacheable at the tail and immutable in the middle</b> — only
+the most recent bucket is still changing, so nearly everything you read has a fixed answer.</p>
+
+<h4>Rung 0 — no cache, recompute every query</h4>
+<p>Every query does the full §8 dance against disk. Correct, and fine at a few queries/s.</p>
+<div class="newprob"><b>Bottleneck:</b> the same recent columnar blocks get decoded and
+re-aggregated thousands of times per minute for identical dashboard/monitor queries. The
+cost is <b>redundant recompute</b>, not data volume or unique load.</div>
+
+<h4>Rung 1 — the OS page cache at the store tier <span style="font-weight:400">(free, already there)</span></h4>
+<p>Recently written Kafka segments and freshly flushed columnar blocks stay resident in the
+<b>OS page cache</b>, so re-reads hit RAM, not disk — the exact mechanism Kafka leans on for
+its read path (<a href="../systems/s2.html">S2</a>, <a href="../primitives/p1.html">P1</a>).
+It costs nothing to add; it's just a property of reading files that were written moments ago.</p>
+<div class="newprob"><b>Bottleneck:</b> the page cache caches <em>bytes</em>, not
+<em>computed results</em>. You still re-decode Gorilla and re-run the scatter-gather
+aggregation on every query — the CPU work, which is the expensive part, isn't saved.</div>
+
+<h4>Rung 2 — keep the recent window in RAM (the head block)</h4>
+<p>The active ~2 h window already lives in the in-memory head block / memtable (§4, §7), so
+interactive "last 15 min / last 1h" queries — the overwhelming majority — never touch disk
+at all. Recency <em>is</em> a cache here.</p>
+<div class="newprob"><b>Bottleneck:</b> it still recomputes the aggregation per query, and
+covers only the leading window; a dashboard over "last 24h" still re-scans older blocks on
+every refresh.</div>
+
+<h4>Rung 3 — a query/result cache keyed on (query, time-bucket) <span style="font-weight:400">(← the missing lever; <a href="../primitives/p4.html">P4</a>)</span></h4>
+<p>Cache the <em>computed result</em> — the finalized per-shard partial or the merged
+aggregate — keyed by <code>(query, time-bucket)</code>. What makes this pay off is
+<b>immutability</b>: once a time bucket has closed, its data never changes (§4), so the cached
+result for that bucket is valid <em>forever</em>. Only the open, most-recent bucket is
+volatile. So split the query window into <b>closed buckets (serve from cache) + the one open
+bucket (recompute)</b>: a "last 24h" dashboard recomputes only the trailing few minutes and
+reads the other ~23h 55m straight from cache. Because the same monitors and widgets ask the
+same questions on a loop, the hit rate on the historical part approaches 100%.</p>
+<div class="newprob"><b>New bottleneck — cache invalidation at the edge (<a href="../primitives/p4.html">P4</a>'s classic problem).</b>
+A <b>late or out-of-order point</b> arriving for a bucket you already treated as "closed"
+makes its cached result stale — so you bound lateness with a watermark (§14) before sealing a
+bucket, or invalidate that entry on late arrival. The open bucket is deliberately never
+cached. And the cache itself now costs memory you must size and evict (LRU on
+<code>(query, bucket)</code>).</div>
+
+<h4>Rung 4 — hot/warm/cold tiering: SSD as a cache over object storage <span style="font-weight:400">(<a href="../primitives/p8.html">P8</a>)</span></h4>
+<p>Zoom out and the whole storage hierarchy is one big cache. Recent blocks sit on local
+<b>SSD</b> (hot); older blocks age out to <b>object storage</b> (cold). The SSD tier is a
+cache in front of S3, and the write-time 1-min/1-hour rollups (§7) are a precomputed cache of
+the raw points.</p>
+<div class="newprob"><b>Bottleneck (accepted):</b> a cold-tier read is slower and comes back
+at coarser, rolled-up resolution — the deliberate trade for storing 1.6 PB/yr cheaply.</div>
+
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>No cache</td><td>a few queries/s</td><td>Identical dashboard/monitor queries recompute thousands×/min</td></tr>
+<tr><td>OS page cache</td><td>re-reads of recent bytes</td><td>Caches bytes, not results — still re-decodes + re-aggregates</td></tr>
+<tr><td>Recent window in RAM</td><td>"last 15m/1h" interactive queries</td><td>Still recomputes; only covers the leading window</td></tr>
+<tr><td>Result cache (← pick)</td><td>repeated queries over closed buckets</td><td>Late points invalidate a "closed" bucket; cache memory</td></tr>
+<tr><td>Hot/cold tiering</td><td>cheap storage of the long tail</td><td>(accepted) cold reads slower + coarser resolution</td></tr>
+</table></div>
+
+<div class="example">
+<span class="tag">Datadog — Husky</span>
+<p>Datadog's Husky event store (metrics, logs, traces) puts a <b>result cache in the reader
+service</b> that stores prior query results <b>at the fragment level</b> — in memory and also
+persisted to disk so results survive service restarts. It reports roughly an <b>80% hit
+rate</b> (≈80% of fragment-level queries served straight from cache), driven exactly by the
+repetition above: monitor evaluations, dashboard widgets, and automatic UI refreshes asking
+the same thing on a loop. It works because Husky's historical data snapshots and shard
+placements are <b>immutable</b> over a fixed time range — the very property that makes a
+closed-bucket result safe to cache forever. Husky also buckets events by <b>time dimension</b>
+so a query only scans the buckets its window touches — recency as the primary filter.</p>
+</div>
+
+<h2 class="sec">10 · The hard constraint, in depth: cardinality</h2>
 <div class="hard">
 <p>A metric like <code>request.latency</code> isn't one series — it's one series <em>per
 unique tag combination</em> <code>{service, host, endpoint, status, region, version, …}</code>.
@@ -321,9 +400,9 @@ attaching a 10<sup>7</sup>-user <code>user_id</code> to a 1k-series metric yield
 indexed) from <b>logs/traces</b> (high-cardinality, archived, indexed/sampled selectively).
 It's also why "just put it in a SQL table with a tag column" fails: the index on the tag
 cross-product <em>is</em> the cost, and it grows combinatorially. The same lens explains the
-logs (§10) and traces (§11) strategies — both refuse to index/keep everything.</p>
+logs (§11) and traces (§12) strategies — both refuse to index/keep everything.</p>
 
-<h2 class="sec">10 · Logs pipeline, in depth</h2>
+<h2 class="sec">11 · Logs pipeline, in depth</h2>
 <p>A log is a timestamped event — often a raw text line, ideally structured JSON. At ~1 KB
 it's <b>~62× a metric point</b>, and its fields (request id, user id, full URL, stack trace)
 are <b>unbounded cardinality</b>. At 864 TB/day you cannot index it all; the whole logs
@@ -367,7 +446,7 @@ metrics pipeline. <b>Exclusion filters / sampling:</b> for high-volume low-value
 checks, 200s), keep 1-in-N or drop entirely from the index while still archiving. Both apply
 the cardinality lesson: don't keep at full fidelity what you won't query.</p>
 
-<h2 class="sec">11 · Distributed tracing, in depth</h2>
+<h2 class="sec">12 · Distributed tracing, in depth</h2>
 <p>A <b>trace</b> is the tree of work for one request; each node is a <b>span</b>
 <code>{trace_id, span_id, parent_id, name, service, start, duration, tags}</code>. Spans for
 one trace are emitted by <em>many services</em> on <em>many hosts</em>, arrive out of order,
@@ -411,7 +490,7 @@ baseline for representative volume, tail rules for the traces that matter.</p>
 before sampling</b>, then sample only what you <em>store</em>. So your dashboards and alerts
 see exact request/error/latency numbers even though you keep a tiny fraction of full traces —
 the same "aggregate the cheap summary, archive/sample the expensive raw" move as metrics (§7)
-and logs (§10).</p>
+and logs (§11).</p>
 <h4>Storage &amp; the service map</h4>
 <p>Sampled traces are stored like logs — high-cardinality events indexed by
 <code>trace_id</code>, service, resource, and tags, time-partitioned and tiered. From the span
@@ -419,7 +498,7 @@ parent/child edges plus service tags you derive a <b>service dependency map</b> 
 whom, with latency/error rates on each edge) — computed by aggregating span relationships,
 again from the full stream, not the sampled store.</p>
 
-<h2 class="sec">12 · Correlation — unifying the three pillars</h2>
+<h2 class="sec">13 · Correlation — unifying the three pillars</h2>
 <p>Three pipelines are only an observability <em>platform</em> if you can pivot between them.
 They unify on <b>shared identity</b>: a consistent tag set (<code>service, env, version,
 host</code>) on everything, plus the <b>trace_id</b> propagated into logs and spans. The
@@ -432,7 +511,7 @@ stores are three islands. It's also the answer to the cross-cutting "async work 
 black hole" check — carry trace context through every queue and deferred job so a side effect
 firing minutes later still stitches back to the originating request.</p>
 
-<h2 class="sec">13 · Alerting — deriving when you need a stream processor</h2>
+<h2 class="sec">14 · Alerting — deriving when you need a stream processor</h2>
 <p>"Fire alerts on thresholds" sounds like it demands a real-time stream engine
 (Flink/Kafka Streams). It usually doesn't. Derive the rung from the alert <em>condition</em>.</p>
 <h4>Rung 0 — evaluate rules by querying the store</h4>
@@ -470,7 +549,7 @@ volume → managed state, checkpointing, ops weight.</p>
 correct windowed or anomaly alerting at high volume. The storage and threshold half ships fine
 without one — exactly the requirement to name out loud before adding it.</p>
 
-<h2 class="sec">14 · Scaling &amp; bottlenecks</h2>
+<h2 class="sec">15 · Scaling &amp; bottlenecks</h2>
 <p>At 10× the design stresses on axes that are mostly <em>not</em> point rate. <b>Cardinality</b>
 grows the inverted index and per-series memory (metrics), the log index, and trace volume —
 guarded by tag budgets, the metrics/logs split, index-vs-archive, and trace sampling.
@@ -484,7 +563,7 @@ partitions and the metric/log workers are stateless; the two stateful pieces are
 <b>tail-sampling buffer</b> (bounded by <code>decision_wait</code> and sharded by
 <code>trace_id</code>).</p>
 
-<h2 class="sec">15 · Tradeoffs &amp; alternatives</h2>
+<h2 class="sec">16 · Tradeoffs &amp; alternatives</h2>
 <p>If you needed arbitrary high-cardinality metric slicing (per-user metrics), you'd stop
 pre-aggregating and move toward a <a href="../systems/s8.html">columnar analytics engine</a>
 over raw events — far more flexible, far more expensive, slower. If you needed <em>exact</em>
@@ -492,12 +571,12 @@ percentiles rather than 1%-relative, you'd ship more data. <b>Write-time vs read
 is a dial: precompute fixed granularities (fast reads, more storage) vs store fine points and
 aggregate on query (flexible, slower, cheaper). <b>Pull vs push</b> (§6): pull gives free
 down-detection and server-side control but can't cross trust boundaries; push is universal but
-needs backpressure. <b>Head vs tail sampling</b> (§11): head is cheap and stateless but
+needs backpressure. <b>Head vs tail sampling</b> (§12): head is cheap and stateless but
 outcome-blind; tail keeps the interesting traces but costs buffer + routing. The whole platform
 is a set of dials between <em>cost</em>, <em>query flexibility</em>, <em>resolution</em>, and
 <em>fidelity</em>.</p>
 
-<h2 class="sec">16 · Real-world example</h2>
+<h2 class="sec">17 · Real-world example</h2>
 <div class="example">
 <span class="tag">Datadog</span>
 <p>The two-tier source aggregation (DogStatsD client → Agent, 10 s flush, DDSketch for
@@ -520,7 +599,7 @@ propagation and the head/tail sampling collectors; <b>Elasticsearch</b> is the c
 index-everything logs engine the "without Limits" model reacts against; <b>M3</b> (Uber) and
 <b>Mimir/Thanos</b> scale the Prometheus model with object-storage tiering.</div>
 
-<h2 class="sec">17 · Interview follow-ups (Q&amp;A)</h2>
+<h2 class="sec">18 · Interview follow-ups (Q&amp;A)</h2>
 <p><b>Push or pull for metrics — which and why?</b> Derive from where targets live. <b>Pull</b>
 (Prometheus) when you own the network and targets are stable + discoverable: server controls
 interval/cardinality and gets down-detection free. <b>Push</b> (Datadog/StatsD) when targets are
@@ -547,19 +626,19 @@ the quantile off the merged sketch (§7).</p>
 <p><b>You can't store every log — how do you keep them useful?</b> Decouple ingest from index:
 archive 100% to cheap object storage, index only the ~5% you'll search live, and <b>rehydrate</b>
 older windows on demand. Generate <b>log-based metrics</b> (error counts) before archiving so you
-keep a permanent cheap signal even after raw logs age out (§10).</p>
+keep a permanent cheap signal even after raw logs age out (§11).</p>
 <p><b>Head or tail sampling for traces?</b> <b>Head</b> = decide at the root, stateless and cheap,
 but blind to outcome (drops errors). <b>Tail</b> = buffer all spans of a trace until it completes,
 then keep errors/slow/rare — needs ~100 GB of buffer and routing all of a trace's spans to one
 collector via <code>hash(trace_id)%N</code>. Production answer is <b>hybrid</b>: head baseline +
-tail rules for what matters (§11).</p>
+tail rules for what matters (§12).</p>
 <p><b>If traces are sampled, how are trace dashboards accurate?</b> Compute <b>RED metrics</b>
 (rate/errors/duration) and the service map from <b>100% of spans before sampling</b>; sample only
 what you <em>store</em>. Aggregate signals are exact; only full-trace retrieval is sampled.</p>
 <p><b>How do you pivot from a metric spike to a root cause?</b> Shared identity: consistent
 <code>service/env/version</code> tags everywhere plus a propagated <code>trace_id</code>. Click a
 spike → exemplar trace_id → the trace → its logs (same trace_id). Without a shared key the three
-stores are islands (§12).</p>
+stores are islands (§13).</p>
 <p><b>A team ships a metric tagged with <code>user_id</code> and cardinality explodes — what
 happens, what do you do?</b> The index and write-path memory blow up first (cost is the index, not
 the points). Guard with a <b>tag budget</b>: cap series per metric, drop/alias the offending tag,
@@ -567,8 +646,16 @@ and route that dimension to <b>logs</b> (archived, selectively indexed) instead 
 <p><b>An alert rule takes longer to evaluate than its interval — overlap?</b> Single-flight per
 rule: <b>skip</b> the next tick while the prior evaluation is in flight (or queue at most one), so
 slow rules don't pile up and stampede the query path.</p>
+<p><b>What do you cache, and how do you keep it correct?</b> Cache <b>computed results</b> keyed on
+<code>(query, time-bucket)</code>, not just bytes. It's safe because a <b>closed time bucket is
+immutable</b> (§4), so its result never changes — split a query window into closed buckets (served
+from cache) plus the single open bucket (always recomputed). That's why observability reads are so
+cacheable: history is fixed, only the leading edge moves. Invalidation risk is <b>late/out-of-order
+points</b> landing in a "closed" bucket — bound lateness with a watermark before sealing, or evict
+on late arrival. Under it sit the free layers: OS page cache for recent bytes, the in-RAM head
+block for recent windows, and SSD-over-object-store tiering (§9, <a href="../primitives/p4.html">P4</a>).</p>
 
-<h2 class="sec">18 · Key talking points</h2>
+<h2 class="sec">19 · Key talking points</h2>
 <ul>
 <li>Lead with the hard constraint: <i>"the cost driver is <b>cardinality</b> — unique tag
 combinations — not point rate,"</i> and it governs all three pillars.</li>
@@ -589,17 +676,22 @@ spans before sampling; propagate <b>W3C traceparent</b>.</li>
 <li>Correlate the pillars on shared <b>trace_id + tags</b>; query is <b>scatter-gather with
 pushdown</b>, slowest shard sets the tail (<a href="../primitives/p7.html">P7</a>,
 <a href="../primitives/p12.html">P12</a>).</li>
+<li>Cache reads by exploiting <b>immutability</b>: a <b>result cache</b> on
+<code>(query, closed time-bucket)</code> is valid forever, so only the open bucket recomputes
+(<a href="../primitives/p4.html">P4</a>) — above free page-cache/head-block/SSD-tier layers;
+Datadog's Husky reader hits ~80% this way.</li>
 <li>At-least-once ingest + idempotent points; Kafka buffer + backpressure
 (<a href="../primitives/p9.html">P9</a>, <a href="../primitives/p16.html">P16</a>).</li>
 <li>Derive alerting by rung: query-store → evaluate-rollups → stream processor (forced only by
 event-time/anomaly alerting at volume).</li>
 </ul>
 
-<h2 class="sec">19 · Further reading</h2>
+<h2 class="sec">20 · Further reading</h2>
 <ul>
 <li><a href="https://docs.datadoghq.com/developers/dogstatsd/">Datadog — DogStatsD</a> · <a href="https://docs.datadoghq.com/metrics/distributions/">Distributions</a></li>
 <li><a href="https://www.datadoghq.com/blog/engineering/computing-accurate-percentiles-with-ddsketch/">Datadog — Computing accurate percentiles with DDSketch</a> · <a href="https://www.vldb.org/pvldb/vol12/p2195-masson.pdf">DDSketch paper (VLDB 2019)</a></li>
 <li><a href="https://www.datadoghq.com/blog/logging-without-limits/">Datadog — Logging without Limits</a> (decouple ingestion from indexing)</li>
+<li><a href="https://www.datadoghq.com/blog/engineering/husky-query-architecture/">Datadog — Inside Husky's query engine</a> (fragment-level result cache, ~80% hit rate) · <a href="https://www.datadoghq.com/blog/engineering/introducing-husky/">Introducing Husky</a></li>
 <li><a href="https://opentelemetry.io/docs/concepts/sampling/">OpenTelemetry — Sampling (head vs tail)</a> · <a href="https://www.w3.org/TR/trace-context/">W3C Trace Context</a></li>
 <li><a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf">Gorilla: A Fast, Scalable, In-Memory Time Series Database</a> (Facebook, VLDB 2015)</li>
 <li><a href="https://prometheus.io/docs/introduction/overview/">Prometheus</a> — the pull model and its own TSDB</li>

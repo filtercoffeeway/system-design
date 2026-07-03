@@ -32,7 +32,9 @@ then read `CHECKLIST.md` to see what is done and what to write next.
 ## The idea
 
 This is a **bottleneck-first system design curriculum**, published as a static
-multi-page site under `docs/` (GitHub Pages, deploy from `/docs`, no build step).
+multi-page site served from the **repo root** (GitHub Pages, deploy from `main`
+`/` root, no build step). The live site is
+**https://filtercoffeeway.github.io/system-design/**.
 
 The thesis: don't memorize 50 systems. Learn a small set of **composable
 primitives** (the levers), learn to **diagnose the dominant bottleneck** of any
@@ -44,35 +46,35 @@ bottleneck. A system is:
 
 There are three layers:
 
-- **Part I — Bottleneck Catalog** (on `docs/index.html`): symptom → candidate
+- **Part I — Bottleneck Catalog** (on `index.html`): symptom → candidate
   levers → new bottleneck each introduces. The diagnosis layer.
-- **Part II — 17 Primitives** (`docs/primitives/p1.html` … `p17.html`): the
+- **Part II — 17 Primitives** (`primitives/p1.html` … `p17.html`): the
   composable building blocks.
-- **Part III — 18 Systems** (`docs/systems/s1.html` … `s18.html`): case studies,
+- **Part III — 18 Systems** (`systems/s1.html` … `s18.html`): case studies,
   each = a composition of primitives under one dominant ("hard") constraint.
 
 The numbering of primitives (P1–P17) and systems (1–18) is FIXED. Do not
 renumber — links across the whole site depend on it. The canonical list with
-titles is in `CHECKLIST.md` and in `docs/assets/site.js`.
+titles is in `CHECKLIST.md` and in `assets/site.js`.
 
 ## Repository layout
 
+The site is served from the **repo root** (Pages deploys `main` `/`). The whole
+tree below IS the published site:
+
 ```
-Plan/
-  CLAUDE.md                  <- this file
-  CHECKLIST.md               <- progress tracker; update it every session
-  system-design-curriculum.md  <- original single-file source (reference)
-  index.html                 <- legacy single-page version (leave as-is)
-  docs/                      <- THE SITE (publish this folder)
-    index.html               <- landing: catalog, grids, matrix, sequence
-    assets/
-      style.css              <- all styling (incl. deep-dive callout classes)
-      site.js                <- builds the sidebar nav on every page
-    primitives/p1.html … p17.html
-    systems/s1.html … s18.html
+CLAUDE.md                  <- this file
+CHECKLIST.md               <- progress tracker; update it every session
+system-design-curriculum.md  <- original single-file source (reference, not served)
+index.html                 <- landing: catalog, grids, matrix, sequence
+assets/
+  style.css                <- all styling (incl. deep-dive callout classes)
+  site.js                  <- builds the sidebar nav on every page
+primitives/p1.html … p21.html
+systems/s1.html … s18.html
 ```
 
-`docs/gen scaffold` note: the summary skeletons were generated once. From now on
+Scaffold note: the summary skeletons were generated once. From now on
 **edit the HTML files directly** — there is no build step and no regeneration.
 Each page that still has a `Full write-up` TODO card is unwritten.
 
@@ -187,7 +189,7 @@ allows this CDN. Keep diagrams simple (flowchart `graph LR/TD`, sequence).
 
 ## Verifying your work
 
-After editing, sanity-check links resolve. From `docs/`:
+After editing, sanity-check links resolve. From the repo root:
 ```
 grep -o 'href="[^"#]*\.html"' systems/s6.html   # targets should exist relative to the file
 ```

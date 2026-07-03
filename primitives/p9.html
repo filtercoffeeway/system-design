@@ -111,7 +111,157 @@ fencing token stops a <em>stale</em> writer, an idempotency key stops a <em>dupl
 one &mdash; different failures, both needed for an exactly-once-ish effect.</p>
 </div>
 
-<h2 class="sec">5 &middot; Real-world example</h2>
+<h2 class="sec">5 &middot; High-throughput stream dedup (when a txn-per-message is too costly)</h2>
+<p>Sections 2&ndash;3 assume you can afford a <b>transactional DB write per operation</b>.
+At a few thousand ops/s against Postgres that is fine. In a <a href="../systems/s2.html">Kafka</a>-style
+stream at hundreds of thousands of messages/s, a synchronous unique-constraint
+<code>INSERT</code> on every message <em>is</em> the bottleneck. Same job &mdash; suppress repeats
+&mdash; new scale, so the ladder keeps climbing. Duplicates here come from two places:
+<b>producer retries</b> (a produce that was applied but whose ack was lost gets re-sent) and
+<b>consumer reprocessing</b> (a worker crashes after doing the work but before committing its
+offset, so on restart it replays).</p>
+<h4>Rung A — idempotent producer</h4>
+<p><code>enable.idempotence=true</code>: the broker tags each producer with a PID and a
+<b>per-partition sequence number</b> and rejects a re-sent sequence. Kills retry duplicates for
+free. Scoped to <b>one producer session, one partition</b> &mdash; a producer restart (new PID),
+a repartition, or a business-level dup (the same event emitted by two different requests) sails
+straight through.</p>
+<h4>Rung B — transactions / exactly-once (EOS)</h4>
+<p>Commit consumer offsets <em>inside</em> the produce transaction
+(<code>processing.guarantee=exactly_once_v2</code> in Kafka Streams). Exactly-once across the
+consume&rarr;transform&rarr;produce loop &mdash; but only when <b>both ends are Kafka</b>. The moment
+the sink is Postgres, S3, or a search index, it is outside the transaction, and coordinator
+round-trips add latency.</p>
+<h4>Rung C — external dedup store + TTL</h4>
+<p><code>SET key NX EX &lt;ttl&gt;</code> in Redis, or a conditional put in DynamoDB: first writer
+wins, TTL bounds memory to a <b>window</b>. Handles many consumers, but now every message pays a
+<b>synchronous network hop</b> &rarr; throughput cap and a hotspot, and duplicates arriving outside
+the TTL window slip through.</p>
+<div class="note"><b>Where a single Redis node caps out.</b> Three ceilings; for a windowed dedup
+the <b>memory</b> one usually bites first. <b>Throughput:</b> commands run on one core, so ~100k ops/s
+per node &mdash; and dedup can&rsquo;t pipeline (you need each &ldquo;seen?&rdquo; answer inline), so a
+single connection is latency-bound at <code>&asymp; 1/RTT</code> (~2&ndash;5k ops/s at 0.2&ndash;0.5 ms) and
+reaching the node ceiling needs ~50 concurrent connections. <b>Memory:</b> a TTL window costs
+<code>rate &times; window &times; bytes/key</code>, which outruns a node&rsquo;s practical RAM (single-thread
+economics + fork pauses + resync time keep nodes ~100&ndash;400 GB). <b>Scale-out:</b> Redis Cluster shards
+~linearly (dedup is keyed, so no cross-shard atomicity is lost), but adds a cluster to run, hot keys stay hot,
+and every message still pays the hop &mdash; exactly what Rung D removes.</div>
+<div class="estimate">100k msg/s × 86,400 s (24h) × ~60 B/key ≈ 520 GB   → exceeds one node</div>
+<h4>Rung D — partition-align the key &rarr; local state</h4>
+<p>Make the <b>dedup id the partition key</b>. Every copy of a logical event then lands on the same
+partition, owned by one consumer, so &ldquo;have I seen this?&rdquo; becomes a <b>local
+<a href="../systems/s2.html">RocksDB</a> lookup</b> &mdash; no network, scaling linearly with
+partitions. This is the unlock (Segment, below). Still windowed; a hot key skews one partition.</p>
+<h4>Rung E — bound the memory with a Bloom filter</h4>
+<p>Even local, an exact set of a full window of keys is large. A <b>Bloom filter</b> is the
+probabilistic &ldquo;have I seen this?&rdquo; that trades a rare, quantifiable error for an
+order-of-magnitude smaller footprint &mdash; the subject of the next section.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Guarantee</th><th>Breaks on</th></tr>
+<tr><td>A · idempotent producer</td><td>no retry dupes</td><td>one session/partition only</td></tr>
+<tr><td>B · transactions / EOS</td><td>exactly-once, Kafka&rarr;Kafka</td><td>external sinks; latency</td></tr>
+<tr><td>C · external store + TTL</td><td>cross-consumer dedup</td><td>network hop, hotspot, window misses</td></tr>
+<tr><td>D · partition-aligned local state</td><td>local check, scales w/ partitions</td><td>hot keys; still windowed</td></tr>
+<tr><td>E · Bloom / probabilistic</td><td>tiny memory per key</td><td>false positives (§6)</td></tr>
+</table></div>
+
+<h2 class="sec">6 &middot; Bloom filters, in depth</h2>
+<p>A <b>Bloom filter</b> answers one question &mdash; <i>&ldquo;have I seen this key?&rdquo;</i> &mdash;
+using far less memory than storing the keys, at the price of a <b>one-sided error</b>. It is a bit
+array of <b>m</b> bits (all 0) plus <b>k</b> independent hash functions, each mapping a key to a
+position in <code>[0, m)</code>.</p>
+<ul>
+<li><b>insert(x):</b> set the bits at <code>h&#8321;(x), &hellip;, h&#8342;(x)</code> to 1.</li>
+<li><b>query(x):</b> if <b>all</b> k of those bits are 1 &rarr; &ldquo;<b>maybe</b> present&rdquo;;
+if <b>any</b> is 0 &rarr; &ldquo;<b>definitely absent</b>.&rdquo;</li>
+</ul>
+<p>The asymmetry is the whole point: <b>no false negatives</b> (anything you inserted has its k bits
+set, so a query on it can never say &ldquo;absent&rdquo;), but <b>false positives</b> are possible &mdash;
+other keys&rsquo; bits can collectively light up all k of a never-inserted key&rsquo;s positions. There is
+also no plain delete (clearing a bit could erase a bit shared with another key; see variants).</p>
+<h3>A tiny worked example (m = 16, k = 3)</h3>
+<div class="estimate">insert A → h = (2, 7, 11)     insert B → h = (4, 7, 13)
+
+index:  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+bit:    0  0 [1] 0 [1] 0  0 [1] 0  0  0 [1] 0 [1] 0  0
+
+query C → h = (2, 4, 13):  bits 2,4,13 are ALL set  → "maybe present"
+  …but C was never inserted → FALSE POSITIVE
+  (bit 2 set by A, bits 4 &amp; 13 set by B)</div>
+<pre class="mermaid">
+graph LR
+  X[key x] --> H1[h1] & H2[h2] & H3[h3]
+  H1 --> B[(bit array m)]
+  H2 --> B
+  H3 --> B
+  B --> Q{all k bits = 1?}
+  Q -->|no| A[definitely absent]
+  Q -->|yes| M[maybe present]
+</pre>
+<h3>The math &mdash; and why cost is per-error, not per-key</h3>
+<p>With <b>n</b> keys inserted into <b>m</b> bits using <b>k</b> hashes, the chance a given bit is
+still 0 is <code>&asymp; e<sup>-kn/m</sup></code>, so the false-positive rate is</p>
+<div class="estimate">p ≈ (1 − e^(−kn/m))^k</div>
+<p>Two design knobs fall out. The optimal number of hashes is
+<code>k = (m/n)&middot;ln2</code>, at which <code>p = 2<sup>-k</sup></code>. And the bits needed
+<em>per element</em> for a target <b>p</b> is</p>
+<div class="estimate">m/n = −ln(p) / (ln 2)²  ≈  −1.44 · log₂(p)</div>
+<p>The striking part: this is <b>independent of n</b>. The memory a Bloom filter costs <em>per key</em>
+depends only on the error you are willing to tolerate, not on how many keys you hold.</p>
+<div class="tablewrap"><table>
+<tr><th>Target FP rate p</th><th>bits / element</th><th>optimal k</th></tr>
+<tr><td>10%</td><td>4.8</td><td>3</td></tr>
+<tr><td>1%</td><td>9.6</td><td>7</td></tr>
+<tr><td>0.1%</td><td>14.4</td><td>10</td></tr>
+<tr><td>0.01%</td><td>19.2</td><td>13</td></tr>
+</table></div>
+<div class="estimate">1,000,000,000 messageIds at 1% FP → 9.6 bits each ≈ 1.2 GB, k = 7
+exact set of 16-byte UUIDs                     ≈ 16 GB raw (more with index)
+→ ~13× smaller, and it fits in RAM</div>
+<h3>The catch: a false positive drops a <em>real</em> message</h3>
+<div class="newprob">
+<p>Translate a false positive into dedup terms. A Bloom &ldquo;maybe present&rdquo; means &ldquo;treat as
+duplicate &rarr; skip.&rdquo; So a false positive <b>silently discards a brand-new, legitimate message.</b>
+That <em>inverts</em> the RPC case in &sect;2: there a duplicate was the hazard; here the probabilistic
+error is <b>data loss</b>. Never use a Bloom filter alone as the source of truth for dedup.</p>
+</div>
+<p>Two safe patterns keep the speed without the loss:</p>
+<ol>
+<li><b>Bloom as a negative cache in front of an exact store.</b> Query the Bloom first. &ldquo;Definitely
+absent&rdquo; &mdash; the common case for genuinely new messages &mdash; means skip the expensive lookup,
+insert, and process. Only on &ldquo;maybe present&rdquo; do you fall through to the exact store
+(RocksDB/Redis) to <b>confirm</b>. The filter absorbs ~99% of lookups; the exact store makes the final
+call, so a false positive costs one extra lookup, not a lost message. This is exactly how RocksDB itself
+works &mdash; each SSTable carries a per-block Bloom filter so a &ldquo;not-found&rdquo; key skips the
+disk read, which is why the local-state lookups in Rung D are cheap.</li>
+<li><b>Accept the loss where it is tolerable</b> &mdash; e.g. &ldquo;have I already notified this user in
+the last hour?&rdquo; for a best-effort push, where a rare skip is fine and 1.2 GB beats 16 GB.</li>
+</ol>
+<h3>Variants</h3>
+<div class="tablewrap"><table>
+<tr><th>Variant</th><th>Adds</th><th>Cost</th></tr>
+<tr><td><b>Counting Bloom</b></td><td>deletes &mdash; each slot is a small counter (e.g. 4 bits), decrement to remove</td><td>~4&times; the space</td></tr>
+<tr><td><b>Scalable Bloom</b></td><td>grows without knowing n up front &mdash; chain filters with geometrically tightening p</td><td>slight FP + indirection</td></tr>
+<tr><td><b>Cuckoo filter</b></td><td>deletes and often less space at low p &mdash; stores fingerprints in a cuckoo table</td><td>more complex inserts</td></tr>
+<tr><td><em>vs</em> exact hash set</td><td>zero error</td><td>~10&times; the memory</td></tr>
+<tr><td><em>vs</em> HyperLogLog</td><td>counts <em>distinct</em> keys, not membership</td><td>different question</td></tr>
+</table></div>
+<div class="note">A sliding window that expires individual old keys needs deletes &mdash; reach for a
+<b>counting</b> Bloom, or rotate two plain filters (active + previous) and drop the older one each window,
+which bounds memory without per-key deletion.</div>
+<div class="example">
+<span class="tag">Segment</span>
+<p>Segment&rsquo;s exactly-once pipeline is Rungs D+E in one system. A dedup <b>worker</b> (Go) reads a Kafka
+input partition, and events are <b>partitioned by <code>messageId</code></b> so the same id always lands
+on the same worker &mdash; shrinking the search space by orders of magnitude versus a central database. Each
+worker keeps a <b>local RocksDB</b> of seen <code>messageId</code>s: consume &rarr; check RocksDB &rarr; if
+new, write the key and publish to the output topic; if seen, skip and ack. They target a <b>24-hour</b>
+dedup window but actually bound it by <b>database size</b> (so it doesn&rsquo;t fall over on a spike) &mdash;
+in practice ~170 days &mdash; alerting on-call if the effective window dips under 24h. RocksDB&rsquo;s
+per-SSTable Bloom filters make the overwhelmingly common &ldquo;not seen&rdquo; check cheap on disk.</p>
+</div>
+
+<h2 class="sec">7 &middot; Real-world example</h2>
 <div class="example">
 <span class="tag">Stripe</span>
 <p>Stripe&rsquo;s API takes an <code>Idempotency-Key</code> header on every mutating
@@ -123,25 +273,31 @@ predictable APIs," and it&rsquo;s the same mechanism that underpins their
 <a href="../systems/s17.html">payment</a> correctness.</p>
 </div>
 
-<h2 class="sec">6 &middot; Applying it in a design</h2>
+<h2 class="sec">8 &middot; Applying it in a design</h2>
 <p>Anywhere you have retries or external effects: <i>"client-supplied idempotency key,
 dedup record written in the same transaction as the effect via a unique constraint,
 at-least-once delivery, reconcile against the provider."</i> Pair it with at-least-once
 queues (<a href="../systems/s2.html">Kafka</a>, <a href="../systems/s12.html">task scheduler</a>)
 so you never need true EOS.</p>
 
-<h2 class="sec">7 &middot; Pitfalls</h2>
+<h2 class="sec">9 &middot; Pitfalls</h2>
 <ul>
 <li>Storing the dedup record in a separate transaction from the effect (race window).</li>
 <li>Keys that are too broad (collisions) or too narrow (retries treated as new).</li>
 <li>Assuming a downstream "succeeded" because your call returned &mdash; reconcile.</li>
 <li>Relying on <code>SELECT</code>-then-<code>INSERT</code> instead of a unique constraint &mdash; it races under concurrent retries.</li>
+<li>Using a Bloom filter as the <em>sole</em> dedup source &mdash; a false positive silently drops a real message. Put an exact store behind it unless the loss is acceptable.</li>
+<li>Undersizing the filter: as inserts pass the planned n, the bit array saturates and the false-positive rate climbs past target &mdash; size for peak-window keys, or use a scalable Bloom.</li>
 </ul>
 
-<h2 class="sec">8 &middot; Further reading</h2>
+<h2 class="sec">10 &middot; Further reading</h2>
 <ul>
 <li><a href="https://stripe.com/blog/idempotency">Stripe &mdash; Designing robust and predictable APIs with idempotency</a></li>
 <li><a href="https://docs.stripe.com/api/idempotent_requests">Stripe API &mdash; idempotent requests</a></li>
+<li><a href="https://segment.com/blog/exactly-once-delivery/">Segment &mdash; Delivering billions of messages exactly once</a> (partition-by-<code>messageId</code> + RocksDB window)</li>
+<li><a href="https://en.wikipedia.org/wiki/Bloom_filter">Bloom filter &mdash; overview, false-positive math, and variants</a> (Bloom, CACM 1970)</li>
+<li><a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Bloom-Filter">RocksDB &mdash; Bloom filters per SSTable (negative-lookup cache)</a></li>
+<li><a href="https://docs.confluent.io/platform/current/streams/concepts.html#processing-guarantees">Confluent &mdash; Kafka Streams processing guarantees (exactly-once v2)</a></li>
 </ul>
 
 <div class="prevnext"><a href="p8.html">&larr; P8 &middot; Tiered / columnar</a><a href="p10.html">P10 &middot; Consensus / fencing &rarr;</a></div>
