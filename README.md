@@ -12,7 +12,7 @@ chain** — every lever you pull creates a new bottleneck.
 
 Static HTML, no build step. Open `index.html` locally, or publish via **GitHub
 Pages → deploy from branch `main`, folder `/ (root)`**. It will serve at
-`https://filtercoffeeway.github.io/system-design-course/`.
+`https://filtercoffeeway.github.io/system-design`.
 
 ## What's inside
 
