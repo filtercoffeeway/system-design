@@ -96,6 +96,16 @@ above (P18–20, S20–22) were added 2026-06-21 from a gap audit against the
 
 ## Changelog
 
+- 2026-07-03 — Staff-level pass on **S19**: derived the 2 TB index size
+  (per-prefix entry blowup, not strings) + materialization depth cap (~5–7
+  chars); reconciled "trie walk" vs hash-sharding (serve-time = prefix→top-k
+  KV get, FST is intra-shard storage); score-merge normalization (rates +
+  capped trend boost, min-support); new §8 rebuild-&-swap ladder (immutable
+  segments, atomic flip, 2× RAM headroom, mixed-version window, build canary);
+  new §10 production concerns (build-time filter + serve-time deny-list,
+  min-support privacy floor, fail-open); 5 new follow-ups; added LinkedIn Cleo
+  counter-example (inverted index + Bloom + forward index; verified via
+  LinkedIn eng blog + GitHub) and Google autocomplete policy blog as sources.
 - 2026-07-03 — Deepened **P3**: added §7 "Replicating read-only config: local
   evaluation & where 'serve stale' fails" — the control-plane/feature-flag
   replication pattern derived as a ladder (per-eval API → local replica + ~10s

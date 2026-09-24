@@ -8,7 +8,7 @@
 <nav class="side" id="side"></nav>
 <main><div class="reading" id="top">
 <div class="crumb"><a href="../index.html">Curriculum</a> / Part III · Systems / Cluster E — Domain-specific</div><h1>19 · Search Autocomplete / Typeahead</h1>
-<div class="summary"><div class="hard"><b>Hard constraint:</b> return ranked completions on <em>every keystroke</em> in a few ms at ~10<sup>6</sup> QPS — so the answer is a <b>precomputed top-k at each prefix</b> served from RAM, with the hot head absorbed at the edge. The matching structure is secondary; the precomputation and the skew are the system.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p2.html">P2</a> (partitioning / hot-key), <a href="../primitives/p4.html">P4</a> (caching), <a href="../primitives/p11.html">P11</a> (CDN / edge), <a href="../primitives/p1.html">P1</a> (batch + stream), <a href="../primitives/p6.html">P6</a> (search retrieval, sibling system <a href="s7.html">S7</a>).</div><p>This is what &ldquo;how does YouTube/Google search work&rdquo; usually means in an interview: the as-you-type suggestion box, not full retrieval (<a href="s7.html">S7</a>). Trie vs FST; materialize top-k at the node; first-letter sharding is the trap; hash + replicate + edge-cache the head fixes the hot key; a streaming speed layer keeps trending queries fresh.</p></div>
+<div class="summary"><div class="hard"><b>Hard constraint:</b> return ranked completions on <em>every keystroke</em> in a few ms at ~10<sup>6</sup> QPS — so the answer is a <b>precomputed top-k at each prefix</b> served from RAM, with the hot head absorbed at the edge. The matching structure is secondary; the precomputation and the skew are the system.</div><div class="prims"><b>Primitives exercised:</b> <a href="../primitives/p2.html">P2</a> (partitioning / hot-key), <a href="../primitives/p4.html">P4</a> (caching), <a href="../primitives/p11.html">P11</a> (CDN / edge), <a href="../primitives/p1.html">P1</a> (batch + stream), <a href="../primitives/p6.html">P6</a> (search retrieval, sibling system <a href="s7.html">S7</a>).</div><p>This is what &ldquo;how does YouTube/Google search work&rdquo; usually means in an interview: the as-you-type suggestion box, not full retrieval (<a href="s7.html">S7</a>). Trie vs FST (serve-time is really a prefix→top-k KV get); materialize top-k to a capped depth; first-letter sharding is the trap; hash + replicate + edge-cache the head fixes the hot key; a streaming speed layer keeps trending fresh (rate-normalized merge); immutable index builds swap in atomically; scrubbing and fail-open are first-class.</p></div>
 
 <hr>
 
@@ -31,11 +31,19 @@
   3.0e10 / 86,400 s                               &asymp; 347,000 QPS average
   peak ~3x                                        &asymp; 1,040,000 QPS
 
-INDEX CORPUS  (head + torso of distinct queries we index)
-  ~5e9 distinct query strings x ~20 chars
-  trie that materializes top-k at EVERY node      &asymp; 2 TB
-    -> too big for one box; fits across a small fleet in RAM
-    -> an FST (suffix-shared, bit-packed) cuts this several-fold
+INDEX CORPUS — derive the size, don't assert it
+  index the head + torso, NOT every string ever typed:
+    ~1e9 distinct queries x ~20 chars              &asymp; 20-25 GB raw strings
+  the blowup is MATERIALIZATION, not the strings:
+    a query of length L sits in the top-k list of up to ~L prefixes
+    -> prefix entries &asymp; 1e9 queries x ~20 each     &asymp; 1e10 entries (after sharing)
+    -> each entry: k=10 x (8 B ref + 4 B score) + key overhead &asymp; ~200 B
+    -> 1e10 x ~200 B                                &asymp; 2 TB   <- where the number comes from
+  two cuts that make it tractable:
+    cap materialization DEPTH at ~5-7 chars (deep prefixes have tiny
+    candidate sets; scan them live in the FST)      -> ~1e9 entries, 200-400 GB
+    FST suffix-sharing + bit-packing on the strings -> several-fold smaller again
+    -> still multi-hundred-GB: a small RAM fleet, never one box
 
 TRAFFIC SKEW  (why caching dominates)
   top ~10,000 prefixes  &asymp;  50-70% of ALL suggest traffic
@@ -48,7 +56,7 @@ SERVING
 
 LATENCY BUDGET
   p99 < ~100 ms end-to-end; serving lookup a few ms (walk + return cached list)</div>
-<p>The takeaways that drive the rest: it&rsquo;s a <b>read/caching problem</b> with a 2&nbsp;TB in-memory index; aggregate QPS is small (~21 boxes), so what actually hurts is <b>fitting the index</b> and <b>surviving the skew</b>; and freshness can&rsquo;t come from batch alone.</p>
+<p>The takeaways that drive the rest: it&rsquo;s a <b>read/caching problem</b>; the naive materialize-everything index is ~2&nbsp;TB and the blowup is the <em>per-prefix top-k entries</em>, not the strings — so the depth cap and the FST are where the memory fight is won; aggregate QPS is small (~21 boxes), so what actually hurts is <b>fitting the index</b> and <b>surviving the skew</b>; and freshness can&rsquo;t come from batch alone.</p>
 
 <h2 class="sec">3 &middot; API design</h2>
 <div class="estimate">GET /suggest?q=net&amp;k=8&amp;lang=en&amp;ctx=...
@@ -77,7 +85,9 @@ Client rules (offload work to the edge of the system):
 <div class="estimate">node "net"  ->  precomputed top-k (sorted by score, computed offline)
   ["netflix", "net worth", "netflix login", "netgear", "net a porter", ...]
 walk: n -> e -> t   (3 hops)   then return the list. No sort at serve time.</div>
-<p><b>Typo tolerance</b>, when the interviewer asks: run the prefix walk against a <b>Levenshtein automaton</b> (edit-distance ≤1–2) intersected with the FST — the same structure traversed fuzzily, no separate index.</p>
+<div class="note"><p><b>Be precise about what &ldquo;walk the trie&rdquo; means once the system is distributed.</b> At serve time nobody walks a pointer structure across the network: the request carries the <em>whole</em> prefix string, so the lookup is logically a <b>KV get — key = prefix, value = its precomputed top-k list</b> — routed to exactly one shard. The trie/FST is the <em>storage format inside a shard</em>: it&rsquo;s how a shard packs millions of prefix→top-k entries into RAM with shared structure, not how a request travels. Keeping these two layers straight is what makes §6&rsquo;s hash-sharding coherent — you can hash-shard KV keys; you cannot hash-shard a pointer walk. (Redis-backed toy designs make the KV view explicit: <code>ZSET</code> per prefix; the FST is the grown-up, 10× smaller version of the same mapping.)</p>
+<p><b>And cap the depth.</b> Materialize top-k only for prefixes up to ~5–7 chars (tunable per corpus). Short prefixes are where precomputation pays: candidate sets are huge and traffic is hot. Past the cap, the surviving candidate set under any node is small — tens of completions — so the shard finds the deepest materialized ancestor and <em>scans the FST subtree live</em>, which is a few µs over a handful of entries. This one decision cuts the naive 2&nbsp;TB (§2) by ~5–10× and is the difference between a hand-wavy index and one that fits.</p></div>
+<p><b>Typo tolerance</b>, when the interviewer asks: run the prefix walk against a <b>Levenshtein automaton</b> (edit-distance ≤1–2) intersected with the FST — the same structure traversed fuzzily, no separate index. The automaton for &ldquo;netflox&rdquo; with distance 1 accepts &ldquo;netflix&rdquo;; intersection prunes the FST to states both machines accept, so cost stays proportional to the surviving candidate set, not the corpus. Cheap enough to run <em>only</em> when the exact walk returns few/no results — a fallback path, not the main path.</p>
 
 <h2 class="sec">5 &middot; High-level architecture</h2>
 <pre class="mermaid">
@@ -106,7 +116,7 @@ graph LR
 <div class="newprob"><b>Bottleneck — catastrophic skew (the hot-key problem, <a href="../primitives/p2.html">P2</a>):</b> letters and short prefixes are wildly non-uniform. The shard owning <code>s</code>/<code>t</code>/<code>a</code>, or hot prefixes like <code>how…</code>, <code>yo…</code>, <code>the…</code>, takes a huge multiple of an even share. With ~26 buckets you <em>cannot</em> rebalance, and you can&rsquo;t split a hot letter without abandoning the alphabet rule. Worse, <b>short prefixes are simultaneously the hottest and the most expensive</b> (largest candidate sets), so the skew compounds.</div>
 
 <h4>Rung 2 — shard by <code>hash(prefix)</code></h4>
-<p>Map each distinct prefix string to a shard via consistent hashing (<a href="../primitives/p2.html">P2</a>). Now load spreads evenly across <em>distinct</em> prefixes and you can add shards smoothly.</p>
+<p>Map each distinct prefix string to a shard via consistent hashing (<a href="../primitives/p2.html">P2</a>). This works <em>because</em> serving is a KV get, not a walk (§4): the request already carries the full prefix, so it routes to exactly one shard — <b>no fan-out, no cross-shard traversal, one network hop</b>. The price is denormalization: &ldquo;netflix&rdquo; is stored in the top-k entries of <code>n</code>, <code>ne</code>, <code>net</code>, … which may live on different shards — but that duplication is already counted in §2&rsquo;s 1e10-entry math, and it&rsquo;s read-optimized duplication of an offline-built artifact, so it costs memory, not correctness. Load now spreads evenly across <em>distinct</em> prefixes and you can add shards smoothly.</p>
 <div class="newprob"><b>Bottleneck:</b> hashing fixes <em>structural</em> skew (the alphabet) but not <em>popularity</em> skew. Every request for <code>yout</code> still hashes to the <b>same single shard</b> — one viral prefix is still one hot key. Hashing balances the many, not the one.</div>
 
 <h4>Rung 3 — attack popularity skew directly <span style="font-weight:400">(← the real fix)</span></h4>
@@ -143,18 +153,70 @@ graph LR
 <li><b>Exponential time decay</b> on the counts, so &ldquo;trending&rdquo; means <em>rising now</em>, not popular all-time — a term that spikes can outrank an evergreen one within minutes.</li>
 </ul>
 
-<h4>Merge at serve time</h4>
-<p>The suggest service consults the stable base <em>and</em> the fresh top-k layer and merges the two ranked lists before returning. A query that started trending minutes ago shows up via the speed layer; later the batch layer folds it into the base and the speed layer&rsquo;s decayed entry ages out. That two-layer merge is exactly &ldquo;results are close to real-time and pull from a stream to stay fresh.&rdquo;</p>
+<h4>Merge at serve time — and how the scores are actually made comparable</h4>
+<p>The suggest service consults the stable base <em>and</em> the fresh top-k layer and merges the two ranked lists before returning. A query that started trending minutes ago shows up via the speed layer; later the batch layer folds it into the base and the speed layer&rsquo;s decayed entry ages out.</p>
+<p>&ldquo;Merge two ranked lists&rdquo; hides the hard part: the scores are <b>incomparable</b>. The base score is a count over ~a day; the fresh score is a decayed sketch count over ~minutes — raw magnitudes differ by orders of magnitude, so naive interleaving either drowns the fresh layer or lets it hijack every slot. Normalize both to <b>rates</b>, then boost:</p>
+<div class="estimate">base_rate(q)  = batch_count(q) / batch_window        (e.g. per-second, all-day avg)
+fresh_rate(q) = decayed_count(q) / effective_window  (per-second, last ~10 min)
+
+trend_boost(q) = fresh_rate / (base_rate + &epsilon;)          &epsilon; guards divide-by-zero for new queries
+score(q)       = base_rate x clamp(trend_boost, 1, B)    B &asymp; 10-50 caps the hijack
+
+example: "&lt;celebrity&gt; news"  base 2M/day &asymp; 23/s;  spikes to 500/s over 10 min
+  -> boost &asymp; 21x -> jumps from rank ~40 to top-3 while the spike lasts,
+     decays back as the fresh counter cools. An evergreen "netflix" (flat rate,
+     boost &asymp; 1) is untouched.</div>
+<p>Two guards matter as much as the formula. <b>Cap the boost</b> (the <code>clamp</code>): an unbounded ratio lets a coordinated burst — or a CMS over-count on a rare string — take over the suggestion box. And require <b>minimum support</b>: a query must be seen from ≥N distinct users before the fresh layer may surface it at all, which simultaneously blocks bot manipulation and the privacy failure of echoing one person&rsquo;s typed string to the world (see §10).</p>
 <div class="tablewrap"><table>
 <tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
 <tr><td>Daily batch rebuild only</td><td>stable, popular queries</td><td>Can&rsquo;t show anything trending since the last rebuild</td></tr>
 <tr><td>+ streaming speed layer (← pick)</td><td>trending visible in minutes</td><td>(accepted) approximate counts; merge cost — both bounded</td></tr>
 </table></div>
 
-<h2 class="sec">8 &middot; Ranking — beyond raw frequency</h2>
+<h2 class="sec">8 &middot; Rebuild &amp; swap — shipping a new multi-hundred-GB index with zero downtime</h2>
+<p>&ldquo;The batch job rebuilds the base&rdquo; is where most answers stop and where staff-level questions start: <em>how does a fleet of RAM-resident shards cut over to a new build while serving ~1M QPS?</em> Derive it.</p>
+
+<h4>Rung 0 — mutate the live structure in place</h4>
+<p>Apply count changes directly to the serving trie: bump a counter, re-sort the node&rsquo;s top-k.</p>
+<div class="newprob"><b>Bottleneck:</b> three independent killers. (1) Write-rate: ~350k QPS of count updates against the structure you&rsquo;re reading at ~1M QPS means lock contention or torn reads on the hot path. (2) The compact structures that make the index fit (FST, succinct tries) are <b>build-then-serve</b> — they achieve their size precisely by giving up in-place mutability. (3) One bad update has no rollback. In-place mutation dies on the same axis three ways; the fix is to stop mutating.</div>
+
+<h4>Rung 1 — immutable versioned builds, atomic pointer flip <span style="font-weight:400">(← the answer)</span></h4>
+<p>The batch job writes each shard&rsquo;s new segment as an <b>immutable, versioned, checksummed artifact</b> to blob storage. Each shard node then: downloads its segment v<sub>N+1</sub>, loads it <em>alongside</em> the live v<sub>N</sub>, warms it (page it in, verify checksums, replay a sample of recent real queries against it), and finally flips a single atomic pointer so new requests hit v<sub>N+1</sub>. In-flight requests finish on v<sub>N</sub>; it&rsquo;s dropped when its refcount hits zero. Rollback is the same pointer flip in reverse — v<sub>N</sub> is still on disk.</p>
+<div class="newprob"><b>Bottleneck — the swap costs 2&times; RAM.</b> During load-alongside, a node holds two full copies of its segment. At multi-hundred-GB fleet-wide that headroom is a real capacity line item you must provision, not a footnote. Alternatives that trade the axis: <b>rolling swap</b> — pull one replica out of the load balancer, swap it cold, re-add, repeat — needs N+1 replica capacity instead of 2&times; RAM per node (and you already have replicas for the hot shards, §6); or <b>mmap the segment</b> and let the OS page cache hold the hot part, so &ldquo;2&times;&rdquo; is 2&times; of the warm set, not the whole file — at the cost of page-fault tail latency on cold prefixes.</div>
+
+<h4>The mixed-version window — say why it&rsquo;s fine</h4>
+<p>Shards flip at different times, so for some minutes a user&rsquo;s <code>ne</code> may be served by build N while <code>net</code> comes from N+1 — the two lists can disagree about a completion&rsquo;s rank or existence. This is <b>fine, by design</b>: §1 already accepted eventually-consistent ranking, suggestions are hints with no cross-request invariant, and the edge cache (§6) was <em>already</em> serving results up to a TTL stale. The mixed-version window is just one more bounded staleness source, strictly smaller than the ones already accepted. (If you ever needed cross-shard version agreement, you&rsquo;d pay for it with a coordinated flip — a barrier via config service/ZooKeeper — and you&rsquo;d be paying for a property this product doesn&rsquo;t need.)</p>
+
+<h4>Canary the build, not just the code</h4>
+<p>A corrupted or skewed build is the scariest failure — it serves fast, valid-looking, <em>wrong</em> answers fleet-wide. Treat each index build like a deploy: flip ~1% of nodes (or mirror shadow traffic to v<sub>N+1</sub>), watch <b>suggestion CTR, empty-result rate, and p99</b> against the v<sub>N</sub> baseline, then promote or auto-rollback. Guardrails in the builder too: refuse to publish a build whose entry count or size deviates &gt;X% from the previous one — a half-empty query log (upstream outage) must not become tomorrow&rsquo;s empty suggestion box.</p>
+<div class="tablewrap"><table>
+<tr><th>Rung</th><th>Good until</th><th>Breaks on</th></tr>
+<tr><td>Mutate live structure in place</td><td>toy scale, mutable trie</td><td>Read/write contention at ~1M QPS; FST/succinct structures aren&rsquo;t mutable; no rollback</td></tr>
+<tr><td>Immutable build + atomic flip (← pick)</td><td>—</td><td>(accepted) 2&times; RAM headroom during swap; mixed-version window — both bounded</td></tr>
+<tr><td>+ rolling swap / mmap</td><td>trades RAM headroom for replica capacity / fault-latency</td><td>(accepted) slower rollout; cold-page tail</td></tr>
+<tr><td>+ canary &amp; build guardrails</td><td>bad builds caught at 1% blast radius</td><td>(accepted) rollout latency of hours, fine for a daily base</td></tr>
+</table></div>
+
+<h2 class="sec">9 &middot; Ranking — beyond raw frequency</h2>
 <p>Popularity is the baseline signal, not the ranker. Production systems re-rank with a model over: query frequency + recency/trend, the user&rsquo;s own history, location/language, session context (the previous query), and — for YouTube specifically — video-side signals like watch-time, freshness, and channel authority. Mechanically it stays cheap: <b>candidate generation</b> produces the ~50–100 completions for a prefix (frequency-ordered, from the trie/FST), then the model <b>re-ranks only that small candidate set</b>. You never run the model over the whole corpus — only over what a prefix already narrowed it to. Personalization is the same shape: candidate-gen stays global, personalization is a re-rank of the small set, so it never blows up the index.</p>
 
-<h2 class="sec">9 &middot; Interview follow-ups (pre-empted)</h2>
+<h2 class="sec">10 &middot; Production concerns — scrubbing, privacy, failing open</h2>
+<p>Three things real autocomplete systems cannot skip, and most interview answers do.</p>
+
+<h4>Scrubbing: suggestions are speech the product utters</h4>
+<p>A search <em>result</em> is someone else&rsquo;s page; a <em>suggestion</em> is your product completing the user&rsquo;s sentence — which is why autocomplete has policy and legal exposure search results don&rsquo;t (defamation claims, court-ordered removals, and policy classes like hateful/violent/explicit predictions that Google documents publicly). Mechanically it&rsquo;s two layers with very different latencies:</p>
+<ul>
+<li><b>Build-time filter</b> (bulk, slow): during the batch build, drop candidates that match blocklists and policy classifiers (hate/adult/violence/PII patterns), per jurisdiction where required. Cheap here because it&rsquo;s offline and touches the whole corpus once per build.</li>
+<li><b>Serve-time deny-list</b> (tiny, fast): a takedown cannot wait for tomorrow&rsquo;s rebuild. Keep a small, replicated exact-match set (thousands of entries — it fits anywhere) consulted on every response, pushed via config/pub-sub so a removal propagates in <b>minutes</b>. It also has to be enforced <em>at or after</em> the edge cache, or short-TTL cached entries keep serving the removed suggestion; in practice: filter at the suggest service <em>and</em> purge/expire the affected edge keys.</li>
+</ul>
+
+<h4>Privacy: minimum support is a hard floor</h4>
+<p>Anything a user types becomes candidate input — names, addresses, medical queries. The invariant: <b>never suggest a string seen from fewer than N distinct users</b> (N in the tens-to-hundreds, plus time-window constraints). This one threshold does triple duty: it keeps one person&rsquo;s query from being echoed to others, it blocks single-source bot campaigns from planting suggestions, and it shrinks the candidate corpus for free. The Zipf tail you refuse to suggest was mostly unsuggestable noise anyway — which is also why §2&rsquo;s indexed corpus is ~1e9 and not &ldquo;every distinct string ever typed.&rdquo;</p>
+
+<h4>Fail open: suggest must never take search down with it</h4>
+<p>Autocomplete is an enhancement to a text box that works fine without it. Encode that asymmetry everywhere: the <b>client</b> sets a hard ~100–200&nbsp;ms timeout and silently renders nothing on miss (an empty dropdown, never a spinner or an error); the <b>edge</b> serves stale cached lists (<code>stale-while-revalidate</code>) when the origin is slow; the <b>suggest service</b> circuit-breaks per shard — a dead shard means degraded suggestions for its slice of prefixes, not queued requests backing up into the gateway. The SLO conversation writes itself: search availability must be fully decoupled from suggest availability; suggest gets its own (looser) SLO and its own error budget. Saying &ldquo;this component is allowed to fail, and here is the mechanism that makes its failure invisible&rdquo; is a staff-level signal.</p>
+
+<h2 class="sec">11 &middot; Interview follow-ups (pre-empted)</h2>
 <ul>
 <li><b>&ldquo;Why not <code>LIKE 'pre%'</code> on an indexed column?&rdquo;</b> A B-tree gives you the prefix <em>range</em>, but you still scan + sort by score per query, at ~350k+ QPS, under a few-ms budget. The DB falls over on both QPS and re-ranking cost. Precomputed top-k in RAM is what hits the latency target.</li>
 <li><b>&ldquo;How do you update one node&rsquo;s top-k when a count changes?&rdquo;</b> You don&rsquo;t, per event. Counts flow through the speed layer; the materialized top-k is refreshed by batch rebuild plus the merged fresh layer. In-place trie edits at write-rate are exactly what you avoid.</li>
@@ -163,30 +225,43 @@ graph LR
 <li><b>&ldquo;Cache hit rate and TTL?&rdquo;</b> The head is ~50–70% of traffic in ~10k entries → very high hit rate on a tiny cache; a TTL of seconds–minutes keeps trending fresh while still absorbing the hot keys.</li>
 <li><b>&ldquo;Personalized suggestions?&rdquo;</b> Candidate generation stays global (prefix → top-k); personalization is a re-rank of that small candidate set with per-user signals — it doesn&rsquo;t touch the index size.</li>
 <li><b>&ldquo;Multi-language / Unicode?&rdquo;</b> Index per language/locale (separate FSTs) and route by the <code>lang</code> param; normalize (case-fold, strip accents) before the walk so &ldquo;cafe&rdquo; and &ldquo;café&rdquo; share a path.</li>
+<li><b>&ldquo;How do you merge batch and fresh scores — they&rsquo;re on different scales?&rdquo;</b> Normalize both to rates, apply a <em>capped</em> trend boost (§7): <code>base_rate &times; clamp(fresh_rate/base_rate, 1, B)</code>. The cap and a min-support threshold stop bursts and sketch over-counts from hijacking the box.</li>
+<li><b>&ldquo;A court orders a suggestion removed. What happens in the next five minutes?&rdquo;</b> Serve-time deny-list pushed via config/pub-sub, enforced at the suggest service, plus purge of the affected edge-cache keys (§10). The build-time filter catches it permanently at the next rebuild. Nothing waits on a 2&nbsp;TB rebuild.</li>
+<li><b>&ldquo;How does a new index version roll out?&rdquo;</b> Immutable per-shard segments, load-alongside, warm, atomic pointer flip, canary at ~1% with CTR/empty-rate guardrails, rollback = flip back (§8). Budget the 2&times; RAM headroom or do a rolling swap through the replicas.</li>
+<li><b>&ldquo;What if the suggest service is down?&rdquo;</b> Nothing, visibly: client timeout → empty dropdown; edge serves stale; search itself is untouched (§10). Suggest is fail-open by construction.</li>
 </ul>
 
-<h2 class="sec">10 &middot; Real-world example</h2>
+<h2 class="sec">12 &middot; Real-world examples</h2>
 <div class="example">
 <span class="tag">Google / YouTube suggest · Elasticsearch/Lucene</span>
-<p>Google&rsquo;s suggest endpoint returns ranked completions on every keystroke at planet scale, blending all-time popularity with trending and personalized signals — the batch-base-plus-fresh-delta shape above. Lucene/Elasticsearch ship this as concrete machinery: the <b>FST-backed</b> completion suggester stores weighted terms compactly in memory and returns top-k by weight in a prefix walk, with a context suggester for per-category/locale filtering — a production instance of &ldquo;materialize top-k, serve from RAM.&rdquo; The lesson mirrors S14: the interesting engineering is the <b>read/cache and freshness</b> sides; the prefix structure itself is nearly a library call.</p>
+<p>Google&rsquo;s suggest endpoint returns ranked completions on every keystroke at planet scale, blending all-time popularity with trending and personalized signals — the batch-base-plus-fresh-delta shape above. Google&rsquo;s own writeups on autocomplete confirm the production concerns in §10 are load-bearing: predictions come from real aggregate searches (freshness and locality included), and dedicated policy systems remove violent, hateful, explicit, or unreliable-rumor predictions — i.e. scrubbing is a first-class subsystem, not an afterthought. Lucene/Elasticsearch ship the serving machinery concretely: the <b>FST-backed</b> completion suggester stores weighted terms compactly in memory and returns top-k by weight in a prefix walk, with a context suggester for per-category/locale filtering — a production instance of &ldquo;materialize top-k, serve from RAM.&rdquo; The lesson mirrors S14: the interesting engineering is the <b>read/cache and freshness</b> sides; the prefix structure itself is nearly a library call.</p>
+</div>
+<div class="example">
+<span class="tag">LinkedIn Cleo</span>
+<p>LinkedIn open-sourced <b>Cleo</b> (2011, Apache 2.0), the library then powering its typeahead for members, companies, groups, and skills — and it&rsquo;s the instructive <em>counter</em>-example, because LinkedIn&rsquo;s matching requirement breaks the trie. Name search must be <b>partial and out-of-order</b>: &ldquo;soft eng&rdquo; should match &ldquo;software engineer,&rdquo; and &ldquo;jeff w&rdquo; should match &ldquo;Jeff Weiner&rdquo; — there is no single prefix to walk. Cleo&rsquo;s per-partition machinery: an <b>inverted index</b> from term-prefixes to document IDs generates candidates; a tiny <b>per-document Bloom filter</b> (~8 bytes) cheaply rejects documents that can&rsquo;t match all query terms; a <b>forward index</b> then eliminates the Bloom filter&rsquo;s false positives before ranking. The staff-level takeaway: when the matching predicate changes, the <em>structure</em> changes (trie/FST → inverted index + filters), but every invariant of this chapter survives — RAM-resident, partitioned, precomputed candidate generation, and a small candidate set re-ranked at the end.</p>
 </div>
 
-<h2 class="sec">11 &middot; Key talking points</h2>
+<h2 class="sec">13 &middot; Key talking points</h2>
 <ul>
-<li>It&rsquo;s a <b>read/caching problem</b>: precompute top-k at each prefix node, serve from RAM; aggregate QPS is small (~21 boxes) — <b>memory footprint and skew</b> are the real constraints.</li>
-<li><b>Trie</b> to teach, <b>FST</b> to ship (fits ~2&nbsp;TB in RAM); the load-bearing idea is <b>materialized top-k</b>, not the structure name.</li>
+<li>It&rsquo;s a <b>read/caching problem</b>: precompute top-k per prefix, serve from RAM; aggregate QPS is small (~21 boxes) — <b>memory footprint and skew</b> are the real constraints.</li>
+<li><b>Trie</b> to teach, <b>FST</b> to ship; serve-time is really a <b>KV get (prefix → top-k)</b> — the FST is the intra-shard storage format. The load-bearing ideas are <b>materialized top-k</b> and the <b>depth cap (~5–7 chars)</b> that makes the index fit, not the structure name.</li>
+<li>Derive the size: 1e9 queries × ~20 prefix memberships × ~200&nbsp;B/entry ≈ 2&nbsp;TB naive; depth cap + FST bring it to a few hundred GB.</li>
 <li><b>First-letter sharding is the trap</b> — raise it, reject it for catastrophic skew → hash(prefix) for structural balance → <b>replicate + edge-cache the head</b> for popularity skew (<a href="../primitives/p2.html">P2</a>/<a href="../primitives/p11.html">P11</a>) → two-tier trie.</li>
 <li>The head is tiny and huge: ~10k prefixes ≈ 50–70% of traffic, so a small edge cache solves most of the hot-key problem.</li>
-<li><b>Freshness = lambda/kappa:</b> daily batch base + streaming speed layer (Count-Min Sketch + heavy-hitters + time decay), merged at serve time.</li>
+<li><b>Freshness = lambda/kappa:</b> daily batch base + streaming speed layer (Count-Min Sketch + heavy-hitters + time decay); merge by <b>normalizing to rates + a capped trend boost</b> — never interleave raw counts.</li>
+<li><b>Deploys are index swaps:</b> immutable versioned segments, load-alongside, atomic flip, canary with CTR/empty-rate guardrails; budget the 2&times; RAM headroom. The mixed-version window is fine because ranking was already eventually consistent.</li>
+<li><b>Production trio:</b> build-time policy filter + minutes-fast serve-time deny-list (takedowns can&rsquo;t wait for a rebuild); min-support ≥N distinct users (privacy + anti-manipulation); fail open — client timeout, stale-while-revalidate at the edge, per-shard circuit breakers.</li>
 <li>Ranking is <b>candidate-gen then re-rank the small set</b> — never score the whole corpus.</li>
 <li>Boundary: this is suggestion, not retrieval — the actual search is <a href="s7.html">S7</a>.</li>
 </ul>
 
-<h2 class="sec">12 &middot; Further reading</h2>
+<h2 class="sec">14 &middot; Further reading</h2>
 <ul>
 <li><a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/search-suggesters.html">Elasticsearch completion suggester</a> — FST-backed top-k-by-weight prefix completion.</li>
 <li><a href="https://lucene.apache.org/core/9_0_0/suggest/org/apache/lucene/search/suggest/document/package-summary.html">Lucene suggest package</a> — the FST machinery underneath.</li>
 <li>Cormode &amp; Muthukrishnan, <i>Count-Min Sketch</i> — approximate frequency in fixed memory (the speed layer&rsquo;s core).</li>
+<li><a href="https://blog.google/products/search/how-google-autocomplete-works-search/">How Google autocomplete works in Search</a> — Google&rsquo;s own account of prediction sources, freshness, and removal policies (§10&rsquo;s scrubbing, from the primary source).</li>
+<li><a href="https://engineering.linkedin.com/open-source/cleo-open-source-technology-behind-linkedins-typeahead-search">Cleo: the open source technology behind LinkedIn&rsquo;s typeahead</a> (+ <a href="https://github.com/LinkedInAttic/cleo">code</a>) — partial, out-of-order typeahead via inverted index + Bloom filter + forward index.</li>
 </ul>
 
 <div class="prevnext"><a href="s18.html">&larr; S18 &middot; Web crawler</a><a href="s20.html">S20 &middot; Auth &rarr;</a></div>
